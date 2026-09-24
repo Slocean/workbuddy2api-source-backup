@@ -267,7 +267,7 @@ const softRateResetPatternEN = `(?i)reset at (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2
 // 错误风暴（429 轰炸）时尤甚。模式串均为纯常量，与 sanitize.go 的包级
 // 预编译先例保持一致。regexp 并发安全（匹配只读），无需额外锁。
 var (
-	reModelRateLimit = regexp.MustCompile(`"code"\s*:\s*"?` + modelRateLimitCode + `"?`)
+	reModelRateLimit  = regexp.MustCompile(`"code"\s*:\s*"?` + modelRateLimitCode + `"?`)
 	reSoftRateResetCN = regexp.MustCompile(softRateResetPatternCN)
 	reSoftRateResetEN = regexp.MustCompile(softRateResetPatternEN)
 )
@@ -1501,6 +1501,13 @@ type CreditBuckets struct {
 	Expiring int64
 	// Stable 其余有效积分（到期时间更远或无到期时间）。
 	Stable int64
+	// Expiries records every usable package with a known expiry, regardless of soon.
+	Expiries []CreditExpiry
+}
+
+type CreditExpiry struct {
+	Expiry    time.Time
+	Remaining int64
 }
 
 // Total 返回两桶合计可用积分（= UserResource 的 remain 口径）。
@@ -1537,6 +1544,11 @@ func (c *Client) UserResourceDetailed(a *auth.Auth, soon time.Duration) (remain 
 			r = 0
 		}
 		remain += r
+		if r > 0 && acct.CycleEndTime != "" {
+			if end, perr := time.ParseInLocation(packageEndLayout, acct.CycleEndTime, softRateResetLoc); perr == nil && end.After(now) {
+				buckets.Expiries = append(buckets.Expiries, CreditExpiry{Expiry: end, Remaining: r})
+			}
+		}
 		// 分桶：仅 soon>0 且能解析出有效到期时间、且确实在窗口内 → Expiring。
 		if soon > 0 && r > 0 && acct.CycleEndTime != "" {
 			// 上游时间为 UTC+8 墙钟（与 softRateResetLoc 同口径，官网展示时区）。

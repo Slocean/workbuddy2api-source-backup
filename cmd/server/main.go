@@ -85,6 +85,7 @@ func main() {
 	p.SetSoftRateMax(cfg.SoftRateMaxDur)               // 软冷却指数退避封顶（soft_rate_max，默认 2h）
 	p.SetWeights(cfg.Pool.IdleWeightPerHour, cfg.Pool.IdleWeightMax)
 	p.SetCostExploreInterval(cfg.CostExploreIntervalDur) // costTier 探索窗口（issue #136，默认 30m；0 关停）
+	p.SetSelectionPolicy(cfg.Pool.SelectionPolicy)
 
 	// 会话粘性路由（可配关闭）。
 	var sessRouter *session.Router
@@ -215,6 +216,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	go sch.Run(ctx)
+	go sch.RefreshGlobalCredits()
 
 	srv := &http.Server{
 		Addr:              cfg.Listen,

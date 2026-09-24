@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -183,6 +184,21 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 			sessionDeadFails: s.SessionDeadFails,
 			consecutiveFails: s.ConsecutiveFails,
 			creditsExpiring:  expiring,
+		}
+		if !s.CreditObservedAt.IsZero() && now.Sub(s.CreditObservedAt) <= creditObservationTTL {
+			e.creditObservedAt = s.CreditObservedAt
+			var known int64
+			for _, item := range s.CreditExpiries {
+				if item.Remaining <= 0 || !item.Expiry.After(now) || known >= e.credits {
+					continue
+				}
+				if item.Remaining > e.credits-known {
+					item.Remaining = e.credits - known
+				}
+				known += item.Remaining
+				e.creditExpiries = append(e.creditExpiries, item)
+			}
+			sort.Slice(e.creditExpiries, func(i, j int) bool { return e.creditExpiries[i].Expiry.Before(e.creditExpiries[j].Expiry) })
 		}
 		// 恢复熔断器：breakerUntil 在未来才恢复（惰性过滤过期/零值，与落盘同口径）。
 		// retryCount 仅在 breakerUntil 未过期时恢复——已过期则归零（不保留无用退避指数）。
@@ -430,6 +446,8 @@ func (p *Pool) stateOverviewLocked() stateFile {
 			BreakerUntil:     breakerUntil,
 			RetryCount:       retryCount,
 			CreditsExpiring:  e.creditsExpiring,
+			CreditExpiries:   append([]CreditExpiry(nil), e.creditExpiries...),
+			CreditObservedAt: e.creditObservedAt,
 			ModelCooldowns:   mcs,
 			ModelCosts:       mcosts,
 		}

@@ -199,6 +199,20 @@ func (r *Router) ResolveForModel(key, model string) (string, bool) {
 	return uid, true
 }
 
+// ExistingForModel checks an established binding without allocating a new
+// account. Account policies use the pool to choose first-time bindings.
+func (r *Router) ExistingForModel(key, model string) (string, bool) {
+	now := time.Now()
+	r.mu.RLock()
+	e, found := r.entries[key]
+	r.mu.RUnlock()
+	if !found || expired(e, now, r.cfg.TTL) || !r.availableSet(model)[e.uid] {
+		return "", false
+	}
+	r.touch(key, e.uid, now)
+	return e.uid, true
+}
+
 // touch 滚动 lastActive 并异步镜像（只在快路径命中时写最后一次）。
 func (r *Router) touch(key, uid string, now time.Time) {
 	r.mu.Lock()

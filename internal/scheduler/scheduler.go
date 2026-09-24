@@ -293,6 +293,32 @@ func (s *Scheduler) RunCheckinNow() {
 	if _, err := s.CheckinAll(); err != nil {
 		log.Printf("scheduled checkin skipped: %v", err)
 	}
+	s.RefreshGlobalCredits()
+}
+
+// RefreshGlobalCredits reads billing balances without invoking the CN-only
+// check-in endpoint. It runs at startup and after scheduled CN check-ins.
+func (s *Scheduler) RefreshGlobalCredits() {
+	for _, st := range s.cfg.Pool.List() {
+		if st.Disabled {
+			continue
+		}
+		a := s.cfg.Pool.AuthByUID(st.UID)
+		if a == nil || !a.IsGlobal() || a.AccessTokenValue() == "" {
+			continue
+		}
+		remain, buckets, err := s.cfg.Upstream.UserResourceDetailed(a, s.cfg.ExpiringSoonWindow)
+		if err != nil {
+			log.Printf("global user-resource %s: %v", logfmt.Label(st.UID, st.Nickname), err)
+			continue
+		}
+		expiries := make([]pool.CreditExpiry, 0, len(buckets.Expiries))
+		for _, item := range buckets.Expiries {
+			expiries = append(expiries, pool.CreditExpiry{Expiry: item.Expiry, Remaining: item.Remaining})
+		}
+		s.cfg.Pool.ReenableIfCredits(st.UID, remain)
+		s.cfg.Pool.SetCreditsWithExpiries(st.UID, remain, buckets.Expiring, expiries)
+	}
 }
 
 // CheckinAll 全量签到：按需刷新 token → daily-checkin → 查余额 → 解冻冷却账号。
@@ -386,7 +412,11 @@ func (s *Scheduler) CheckinAll() ([]CheckinOutcome, error) {
 			continue
 		}
 		s.cfg.Pool.ReenableIfCredits(st.UID, remain)
-		s.cfg.Pool.SetCreditsDetailed(st.UID, remain, buckets.Expiring)
+		expiries := make([]pool.CreditExpiry, 0, len(buckets.Expiries))
+		for _, item := range buckets.Expiries {
+			expiries = append(expiries, pool.CreditExpiry{Expiry: item.Expiry, Remaining: item.Remaining})
+		}
+		s.cfg.Pool.SetCreditsWithExpiries(st.UID, remain, buckets.Expiring, expiries)
 		oc.Credits = &remain
 		switch oc.Status {
 		case CheckinOK:

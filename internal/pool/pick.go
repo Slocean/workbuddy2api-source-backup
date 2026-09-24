@@ -6,6 +6,7 @@ import (
 	"math"
 	"math/rand/v2"
 	"sort"
+	"strconv"
 	"time"
 
 	"workbuddy2api/internal/auth"
@@ -67,6 +68,22 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 		// 全冷却兜底：无 healthy 候选时，从冷却账号里选 until 最早到期的一个
 		// （熔断/冷却共用 expiry 口径，取较早截止者）。禁用的账号永不参与兜底。
 		return p.pickEarliestExpiryLocked(tried, now, realm)
+	}
+	if e := p.preferredAccount(cands, reqModel, now); e != nil {
+		cost := "unknown"
+		if mc, ok := e.modelCostOf(reqModel, now); ok {
+			cost = strconv.FormatFloat(mc.CostPer1k, 'f', 4, 64)
+		}
+		expiry := "unknown"
+		if at := e.earliestCreditExpiry(now); !at.IsZero() {
+			expiry = at.Format(time.RFC3339)
+		}
+		log.Printf("[pool] selection policy=%s realm=%s model=%s acct=%s credit_expiry=%s cost_per_1k=%s",
+			p.selectionPolicy, realm, reqModel, logfmt.Label(e.a.UID, e.a.Nickname), expiry, cost)
+		e.lastUsed = now
+		p.pickSeq++
+		e.usedSeq = p.pickSeq
+		return e.a
 	}
 	// top5 短名单按三因子权重降序截断（而非 credits 单纯降序）：否则闲置补偿
 	// 根本进不了短名单决策，低 credits 但久置的账号会永远排不进 top5。

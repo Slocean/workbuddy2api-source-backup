@@ -32,16 +32,18 @@ const degradeReason = "consecutive failures"
 
 // Status 单个账号对外暴露的状态（脱敏）。
 type Status struct {
-	UID           string    `json:"uid"`
-	Realm         string    `json:"realm,omitempty"`
-	Nickname      string    `json:"nickname,omitempty"`
-	Credits       int64     `json:"credits"`
-	Cooling       bool      `json:"cooling"`
-	CoolKind      string    `json:"cool_kind,omitempty"`
-	CoolRemaining int64     `json:"cool_remaining_sec,omitempty"`
-	Until         time.Time `json:"until,omitempty"`
-	Reason        string    `json:"reason,omitempty"`
-	SoftStreak    int       `json:"soft_streak,omitempty"` // 连续软冷却次数（指数退避指数，见 entry.softStreak）
+	UID              string         `json:"uid"`
+	Realm            string         `json:"realm,omitempty"`
+	Nickname         string         `json:"nickname,omitempty"`
+	Credits          int64          `json:"credits"`
+	CreditExpiries   []CreditExpiry `json:"credit_expiries,omitempty"`
+	CreditObservedAt time.Time      `json:"credit_observed_at,omitempty"`
+	Cooling          bool           `json:"cooling"`
+	CoolKind         string         `json:"cool_kind,omitempty"`
+	CoolRemaining    int64          `json:"cool_remaining_sec,omitempty"`
+	Until            time.Time      `json:"until,omitempty"`
+	Reason           string         `json:"reason,omitempty"`
+	SoftStreak       int            `json:"soft_streak,omitempty"` // 连续软冷却次数（指数退避指数，见 entry.softStreak）
 	// RateLimitedModels 当前仍在限额的模型列表（issue #36 限额台账）。
 	// 仅「带解析时间 6004」触发的模型级独立冷却（modelCooldowns 未到期条目）时非空，
 	// 每模型一行；运维据此看到"账号 A 的模型 X 还在限额中，预计 Z 时间恢复"。到期即消失（零回归）。
@@ -51,19 +53,19 @@ type Status struct {
 	// 仅 modelCostTTL 内的有效观测，每模型一行（cost_per_1k + last_seen +
 	// samples）；无观测/全部过期 → nil（tier 1 未知层）。过期即消失（零回归，
 	// 只读遍历零风险）。tier 不单独落字段（可由 per1k≤0 推出，零冗余）。
-	ModelCosts []ModelCostStatus `json:"model_costs,omitempty"`
-	Disabled          bool               `json:"disabled"`
-	DisabledReason    string             `json:"disabled_reason,omitempty"` // 仅 disabled 账号：禁用原因（运维可见）
+	ModelCosts     []ModelCostStatus `json:"model_costs,omitempty"`
+	Disabled       bool              `json:"disabled"`
+	DisabledReason string            `json:"disabled_reason,omitempty"` // 仅 disabled 账号：禁用原因（运维可见）
 	// ManualDisabled 运维手动停用（issue #138/#118）——与 disabled **并列独立**，
 	// 叠加态分别透出不合并（面板据此区分「系统判定坏了」与「我主动摘的」，
 	// 两种可用操作不同：前者可 revive，后者该 enable）。
 	// 零值也显式写出（运维口径，同 consecutive_fails：缺失会让人误以为"没记录"）。
-	ManualDisabled bool   `json:"manual_disabled"`
-	ManualReason   string `json:"manual_reason,omitempty"` // 仅手动停用：停用原因（运维可见）
-	SuccessCount      int64              `json:"success_count,omitempty"`
-	ErrTotal          int64              `json:"err_total,omitempty"`
-	LastSuccessTime   time.Time          `json:"last_success,omitempty"`
-	LastErrTime       time.Time          `json:"last_err,omitempty"`
+	ManualDisabled  bool      `json:"manual_disabled"`
+	ManualReason    string    `json:"manual_reason,omitempty"` // 仅手动停用：停用原因（运维可见）
+	SuccessCount    int64     `json:"success_count,omitempty"`
+	ErrTotal        int64     `json:"err_total,omitempty"`
+	LastSuccessTime time.Time `json:"last_success,omitempty"`
+	LastErrTime     time.Time `json:"last_err,omitempty"`
 	// ConsecutiveFails 连续失败计数（连败降权用，见 entry.consecutiveFails）。
 	// 零值也透出（运维口径：与 err_total/session_dead_fails 一致，零值缺失会让人
 	// 误以为"没记录"，实际是零值被 omitempty 省略）。
@@ -102,8 +104,10 @@ type ModelCostStatus struct {
 }
 
 type entry struct {
-	a       *auth.Auth
-	credits int64
+	a                *auth.Auth
+	credits          int64
+	creditExpiries   []CreditExpiry
+	creditObservedAt time.Time
 	// creditsExpiring 即将过期（签到时按 expiringSoon 窗口判定）的可用积分子集，
 	// 是 credits 的一部分（credits = creditsExpiring + 长期积分）。选号权重对其
 	// 额外加成：优先消耗快过期积分，避免官方活动赠送的奖励积分到期作废
@@ -111,23 +115,23 @@ type entry struct {
 	// 签到之间第四因子（weightOf ×8）不应失忆——签到 09:00/21:00 定期刷新，
 	// 窗口外重启会丢快过期积分偏好，可能让奖励积分到期作废。
 	creditsExpiring int64
-	successCount    int64     // 累计成功
+	successCount    int64 // 累计成功
 	// errTotal 累计错误（终身累计，仅状态展示用；选号权重不消费——原「成功率」
 	// 因子已删，见 pick.weightOf 注释与 success-ema-review）。
-	errTotal    int64         // 累计错误（终身累计，供状态展示；选号权重不消费，原成功率因子已删）
-	lastErr     time.Time     // 最近一次错误时间
-	lastSuccess     time.Time // 最近一次成功时间
-	coolKind        CoolKind
-	until           time.Time // 冷却截止（即时冷却：CoolSoft 429 / CoolHard 余额耗尽）
-	disabled        bool
-	reason          string
+	errTotal    int64     // 累计错误（终身累计，供状态展示；选号权重不消费，原成功率因子已删）
+	lastErr     time.Time // 最近一次错误时间
+	lastSuccess time.Time // 最近一次成功时间
+	coolKind    CoolKind
+	until       time.Time // 冷却截止（即时冷却：CoolSoft 429 / CoolHard 余额耗尽）
+	disabled    bool
+	reason      string
 	// manualDisabled 运维手动停用（issue #138/#118）：与 disabled 并列的独立状态位。
 	// 语义是「对话流量摘除」而非「账号冻结」——停用期间签到/token 保活/排程照常执行，
 	// 凭证与积分都是活的，只是不参与选号。与 disabled 各自独立清除，两位都清才回池。
 	// 持久化（stateAccount.ManualDisabled）：重启保留运维意图。
 	manualDisabled bool
 	manualReason   string
-	lastUsed        time.Time // 最近被选中时刻（防并发撞号）
+	lastUsed       time.Time // 最近被选中时刻（防并发撞号）
 	// usedSeq 单调递增的选中序号：每次被 pick 选中时取 p.pickSeq 自增值。
 	// Windows 等平台 time.Now() 精度有限（~0.5ms），高并发/快速连续选号时多个
 	// 账号 lastUsed 完全相等，基于 wall-clock 的 LRU/防惊群判定失效（高并发/低精度时钟下：
@@ -345,17 +349,17 @@ func (e *entry) fallbackKind(now time.Time) string {
 
 // stateAccount 单个账号的持久化状态（JSON tag 全小写下划线，向后兼容：缺字段零值）。
 type stateAccount struct {
-	Credits      int64     `json:"credits"`
-	Disabled     bool      `json:"disabled"`
-	Reason       string    `json:"reason,omitempty"`
+	Credits  int64  `json:"credits"`
+	Disabled bool   `json:"disabled"`
+	Reason   string `json:"reason,omitempty"`
 	// ManualDisabled 运维手动停用（issue #138/#118）。持久化——重启保留运维意图，
 	// 这也正是该功能要解决的痛点之一（旧权宜做法改 state.json 会被 5s flush 覆盖，
 	// 入口化后无需再碰文件）。零值也显式写出（运维口径，同 err_total 注释）。
-	ManualDisabled bool   `json:"manual_disabled"`
-	ManualReason   string `json:"manual_reason,omitempty"`
-	Until        time.Time `json:"until,omitempty"`
-	CoolKind     CoolKind  `json:"cool_kind"`
-	SuccessCount int64     `json:"success_count,omitempty"`
+	ManualDisabled bool      `json:"manual_disabled"`
+	ManualReason   string    `json:"manual_reason,omitempty"`
+	Until          time.Time `json:"until,omitempty"`
+	CoolKind       CoolKind  `json:"cool_kind"`
+	SuccessCount   int64     `json:"success_count,omitempty"`
 	// err_total 累计错误计数。旧版 err_count（连续错误）仍可读：加载时映射到 err_total，
 	// 仅作一次性迁移，不再回写 err_count。
 	// 运维可见的运行态计数（err_total/soft_streak/session_dead_fails/credits_expiring）
@@ -393,7 +397,9 @@ type stateAccount struct {
 	// CreditsExpiring 快过期积分子集（credits 的子集）。持久化以保留第四因子
 	// （weightOf ×8）的快过期积分偏好——重启后到下次签到之间不应失忆。
 	// 零值也显式写出（运维口径，见 err_total 注释）。
-	CreditsExpiring int64 `json:"credits_expiring"`
+	CreditsExpiring  int64          `json:"credits_expiring"`
+	CreditExpiries   []CreditExpiry `json:"credit_expiries,omitempty"`
+	CreditObservedAt time.Time      `json:"credit_observed_at,omitempty"`
 	// ModelCooldowns 6004 模型级独立冷却表（model → 冷却记录）。持久化：
 	// PR #96 把 6004 改成精确对齐上游重置墙钟后，单模型冷却可长达数小时，
 	// 跨重启是常态；不持久化导致每次重启 healthyForModel 失忆、重新踩一遍
