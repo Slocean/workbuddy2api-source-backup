@@ -51,6 +51,25 @@ type Config struct {
 	// AdminEnabled 运维管理端点开关（config admin.enabled，默认 false）。
 	// 关闭时 /admin/* 一律 404（而非 403——不向外暴露"这里存在管理面"）。
 	AdminEnabled bool
+
+	// AdminManagementKey 选号策略管理端点的**独立**管理凭证
+	// （config admin.management_key / env WB2A_ADMIN_MANAGEMENT_KEY）。
+	// 与 APIKey（模型调用 Key）严格分离：/admin/pool/selection-policy 只认它，
+	// 调用 Key 即使合法也 401（修复清单 §3.1 凭证契约，本服务强制执行）。
+	// 空 = 选号管理端点对任何凭证都 401。
+	AdminManagementKey string
+
+	// SelectionPolicyConfigValue config.json（或内置默认）的选号策略初始值。
+	// data 持久化文件缺失时作为 current（首次迁移初始值）。
+	SelectionPolicyConfigValue string
+	// SelectionPolicyLocked 部署配置锁定：WB2A_SELECTION_POLICY 环境变量非空。
+	// 锁定时 PUT 返回 409，运行期改不动。
+	SelectionPolicyLocked bool
+	// SelectionPolicyEnvValue 锁定来源的值（SelectionPolicyLocked=true 时有效）。
+	SelectionPolicyEnvValue string
+	// SelectionPolicyDataPath data/selection-policy.json 的绝对/相对路径
+	// （由 state.json 同目录推导）。空 = 不可持久化，PUT 返回 500。
+	SelectionPolicyDataPath string
 }
 
 // notFoundCooldown 上游 404 的固定短冷却时长。
@@ -117,6 +136,10 @@ func NewHandler(cfg Config) *Handler {
 		h.mux.HandleFunc("POST /admin/accounts/{uid}/disable", h.withAuth(h.adminAccountDisable))
 		h.mux.HandleFunc("POST /admin/accounts/{uid}/enable", h.withAuth(h.adminAccountEnable))
 		h.mux.HandleFunc("POST /admin/accounts/{uid}/revive", h.withAuth(h.adminAccountRevive))
+		// 选号策略管理（总反代平台阶段 3.1）：**独立管理 Key** 鉴权（withManagementKey），
+		// 与上面复用调用 Key 的账号状态端点不同——策略是路由控制面，凭证必须分离。
+		h.mux.HandleFunc("GET /admin/pool/selection-policy", h.withManagementKey(h.selectionPolicyGet))
+		h.mux.HandleFunc("PUT /admin/pool/selection-policy", h.withManagementKey(h.selectionPolicyPut))
 	}
 	h.mux.HandleFunc("GET /healthz", h.healthz)
 	return h
@@ -838,6 +861,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		if peek.Stream {
 			// 流式：透传结束后立即关闭上游 body，避免 defer 在轮转场景下堆积 fd。
 			st.status = http.StatusOK
+			// 归属头（总反代平台阶段 1.1）：必须在响应头写出（首帧 flush）之前
+			// 设置——此刻粘性已重绑到成功号，acct 即本请求最终实际承接的账号。
+			// 失败转移后走到这里的是最后一跳的账号，不是首选候选（修复清单 §4.1）。
+			setAccountAttributionHeader(w, acct)
 			stats := newChatStatsReaderSince(rc, st.start)
 			// gateway_hint（SSE）：成功状态 200 已开流，中途 error 帧透传时附加
 			// hint 字段（hintFn 惰性求值——正常流零开销，只有真撞到 error 帧才
@@ -888,10 +915,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		rc.Close()
 		if err != nil {
 			// 上游流解析失败：客户端还没看到任何输出，回 502 并告知原因。
+			// 注意此处**不**带归属头：没有产生成功响应，Hub 按账号未知口径记。
 			writeOpenAIError(w, http.StatusBadGateway, "upstream_parse", err.Error())
 			st.status = http.StatusBadGateway
 			return
 		}
+		// 归属头（非流式）：在写响应体之前设置，聚合成功后 acct 即终号。
+		setAccountAttributionHeader(w, acct)
 		writeJSON(w, http.StatusOK, resp)
 		st.status = http.StatusOK
 		st.toks = completionTokens(resp)
@@ -956,6 +986,36 @@ func promptTooLongMessage(body string) string {
 		return "prompt is too long"
 	}
 	return body
+}
+
+// attributionUIDHeader / attributionSourceHeader 归属协议私有响应头（阶段 1.1）。
+// Hub 侧只对 WorkBuddy 类供应商解析，且要求 Source=actual 才认定归属；
+// 头值是稳定 UID，不含 token/cookie 等敏感信息。普通客户端无需关心该头。
+const (
+	attributionUIDHeader    = "X-ProxyHub-Account-UID"
+	attributionSourceHeader = "X-ProxyHub-Account-Source"
+)
+
+// setAccountAttributionHeader 在成功响应上标记「本次请求最终实际承接的账号」。
+// 调用时机纪律（修复清单 §4.1）：流式必须在响应头写出前（首帧 flush 前）、
+// 非流式必须在 writeJSON 前——此后账号不可能再变，不存在"流开始后改头"。
+// 错误响应不调用：无真实成功承接时不伪造 UID（Hub 落 unknown 口径）。
+// UID 清洗：超长（>160）或含控制字符直接跳过——宁缺毋错，不往头里放脏数据。
+func setAccountAttributionHeader(w http.ResponseWriter, acct *auth.Auth) {
+	if acct == nil {
+		return
+	}
+	uid := acct.UID
+	if uid == "" || len(uid) > 160 {
+		return
+	}
+	for _, r := range uid {
+		if r < 0x20 || r == 0x7f {
+			return
+		}
+	}
+	w.Header().Set(attributionUIDHeader, uid)
+	w.Header().Set(attributionSourceHeader, "actual")
 }
 
 // rotateBackoff 轮转间指数退避 + 抖动（WAF 403 修复 P0-2，报告 §6）：

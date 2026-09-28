@@ -86,6 +86,18 @@ func main() {
 	p.SetWeights(cfg.Pool.IdleWeightPerHour, cfg.Pool.IdleWeightMax)
 	p.SetCostExploreInterval(cfg.CostExploreIntervalDur) // costTier 探索窗口（issue #136，默认 30m；0 关停）
 	p.SetSelectionPolicy(cfg.Pool.SelectionPolicy)
+	// 选号策略持久化值（总反代平台阶段 3.1.2）：config.json 通常只读挂载，只作
+	// **初始值**；一旦 data/selection-policy.json 存在（首次 PUT 生成）即以它为准，
+	// 重启读回不变。WB2A_SELECTION_POLICY 环境变量优先级最高（部署锁定，运行期
+	// PUT 返回 409），锁定时不读 data 文件。
+	selPolicyPath := server.SelectionPolicyDataPath(cfg.StateFile)
+	selPolicyLocked := os.Getenv("WB2A_SELECTION_POLICY") != ""
+	if !selPolicyLocked {
+		if v := server.LoadPersistedSelectionPolicy(selPolicyPath); v != "" {
+			p.SetSelectionPolicy(v)
+			log.Printf("[server] selection policy restored from data file: %s", v)
+		}
+	}
 
 	// 会话粘性路由（可配关闭）。
 	var sessRouter *session.Router
@@ -211,6 +223,12 @@ func main() {
 		GlobalEnabled: cfg.Global.Enabled,
 		// 运维管理端点开关（config admin.enabled，默认 false）。
 		AdminEnabled: cfg.Admin.Enabled,
+		// 选号策略管理面（阶段 3.1）：独立管理 Key + 锁定/来源/持久化路径。
+		AdminManagementKey:        cfg.Admin.ManagementKey,
+		SelectionPolicyConfigValue: cfg.Pool.SelectionPolicy,
+		SelectionPolicyLocked:      selPolicyLocked,
+		SelectionPolicyEnvValue:    cfg.Pool.SelectionPolicy,
+		SelectionPolicyDataPath:    selPolicyPath,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

@@ -40,6 +40,12 @@ type Config struct {
 	// （withAuth + 同一个 api_key，不另立管理密钥）。
 	Admin struct {
 		Enabled bool `json:"enabled"` // 默认 false
+		// ManagementKey 选号策略管理端点（/admin/pool/selection-policy）的
+		// **独立**管理凭证（总反代平台阶段 3.1.1）。与 api_key（模型调用 Key）
+		// 严格分离：该端点只认它，调用 Key 一律 401。空 = 选号管理端点对任何
+		// 凭证都 401（Hub 侧显示"检查管理凭证"）。env WB2A_ADMIN_MANAGEMENT_KEY
+		// 可覆盖。不做启动 fail-fast：未配置只是该端点不可用，不影响其他管理面。
+		ManagementKey string `json:"management_key"`
 	} `json:"admin"`
 
 	Global struct {
@@ -309,6 +315,9 @@ func applyEnv(c *Config) {
 		if b, err := strconv.ParseBool(v); err == nil {
 			c.Admin.Enabled = b
 		}
+	}
+	if v := os.Getenv("WB2A_ADMIN_MANAGEMENT_KEY"); v != "" {
+		c.Admin.ManagementKey = v
 	}
 }
 
