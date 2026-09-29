@@ -130,6 +130,10 @@ func (h *Handler) selectionPolicyPut(w http.ResponseWriter, r *http.Request) {
 			"data path not configured; cannot persist selection policy")
 		return
 	}
+	// 串行化「持久化 → 内存更新 → 响应组装」：并发 PUT 时后到者覆盖先到者且
+	// 响应各自如实反映自身写入结果，不出现文件/内存/响应三方不一致（§5.3）。
+	h.selPolicyMu.Lock()
+	defer h.selPolicyMu.Unlock()
 	if err := persistSelectionPolicy(h.cfg.SelectionPolicyDataPath, policy); err != nil {
 		writeOpenAIError(w, http.StatusInternalServerError, "persist_failed",
 			"failed to persist selection policy: "+err.Error())
@@ -162,8 +166,20 @@ func (h *Handler) readPersistedSelectionPolicy() string {
 	return v
 }
 
-// persistSelectionPolicy 原子写入：同目录临时文件 + rename（Windows 上 rename
-// 目标存在时 os.Rename 失败，先删旧文件再 rename——窗口内由临时文件的完整性保证）。
+// renameForPersist 替换实现的注入点（故障注入测试用）：正常路径即 os.Rename。
+var renameForPersist = os.Rename
+
+// persistSelectionPolicy 原子写入：目标同目录**唯一**临时文件（os.CreateTemp，
+// 权限 0600）→ 写完整 JSON → fsync → 关闭 → 原子替换目标。全程**绝不先删除
+// 旧目标**（未通过验收修复交接 §5.2）：
+//   - Linux：os.Rename 即 rename(2)，目标存在时原子覆盖；
+//   - Windows：Go 的 os.Rename 走 MoveFileEx(MOVEFILE_REPLACE_EXISTING)，同样原子替换。
+//
+// 旧实现「固定 path+.tmp、先 os.Remove 旧目标再 rename」有两个致命点：删除后、
+// 替换前崩溃/重启会**永久丢旧策略文件**（重启回落 config 初始值）；并发 PUT 争用
+// 同一固定 .tmp 互相覆盖。本实现两者皆除：唯一临时文件互不干扰，替换不经过
+// "目标不存在"窗口。失败路径清理本次临时文件，旧目标保持原状（内容完整）；
+// 运行时策略是否随之保持由调用方负责（selectionPolicyPut 持锁且失败不 Set）。
 func persistSelectionPolicy(path, policy string) error {
 	doc, err := json.MarshalIndent(map[string]string{
 		"selection_policy": policy,
@@ -172,17 +188,40 @@ func persistSelectionPolicy(path, policy string) error {
 	if err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, append(doc, '\n'), 0o600); err != nil {
+	doc = append(doc, '\n')
+
+	dir, base := filepath.Dir(path), filepath.Base(path)
+	tmp, err := os.CreateTemp(dir, base+".tmp-*") // 唯一命名：并发写者不争用同一文件
+	if err != nil {
 		return err
 	}
-	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-		os.Remove(tmp)
+	tmpName := tmp.Name()
+	// 任何后续失败清理本次临时文件；成功路径 rename 后 tmpName 已不存在，Remove 无害。
+	defer func() {
+		if err != nil {
+			os.Remove(tmpName)
+		}
+	}()
+	if _, err = tmp.Write(doc); err != nil {
+		tmp.Close()
 		return err
 	}
-	if err := os.Rename(tmp, path); err != nil {
-		os.Remove(tmp)
+	// 先落盘数据再替换：替换成功即数据完整，不留"半截内容顶着正式文件名"的形态。
+	if err = tmp.Sync(); err != nil {
+		tmp.Close()
 		return err
+	}
+	if err = tmp.Close(); err != nil {
+		return err
+	}
+	if err = renameForPersist(tmpName, path); err != nil {
+		return err
+	}
+	// 目录 fsync 尽力而为：让 rename 本身持久化（Linux 生效；Windows 打开目录
+	// Sync 不支持，错误忽略——崩溃一致性按文件系统能力取上限）。
+	if d, derr := os.Open(dir); derr == nil {
+		_ = d.Sync()
+		_ = d.Close()
 	}
 	return nil
 }

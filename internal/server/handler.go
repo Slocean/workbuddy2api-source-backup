@@ -113,6 +113,12 @@ type Handler struct {
 	// wafIP WAF IP 级拦截状态机（fail-fast，wafip.go）：短窗多号 WAF 403 →
 	// 激活期轮转遇 WAF 403 直接终止（不放大请求量）。进程内状态、重启清零。
 	wafIP wafIPGate
+	// selPolicyMu 选号策略 PUT 串行互斥（未通过验收修复交接 §5.3）：同一 Handler
+	// 的并发 PUT 覆盖「读当前状态 → 写持久化文件 → 更新内存 Pool 策略 → 组装响应」
+	// 全程，防止两个写者交错导致文件内容与内存/GET effective 不一致。
+	// 单进程内互斥；本服务按单容器单进程部署（单写者），多进程共享 data 卷
+	// 不在支持范围（不做跨进程文件锁）。
+	selPolicyMu sync.Mutex
 }
 
 // NewHandler 构建 handler。
