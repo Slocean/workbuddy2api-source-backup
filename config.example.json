@@ -36,7 +36,9 @@
     "cat_enabled": true
   },
   "admin": {
-    "enabled": false
+    "enabled": false,
+    "selection_policy_enabled": false,
+    "management_key": ""
   },
   "global": {
     "enabled": true,

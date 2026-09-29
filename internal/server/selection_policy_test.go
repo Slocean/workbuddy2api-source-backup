@@ -30,12 +30,14 @@ func newSelectionPolicyHandler(t *testing.T, mgmtKey, apiKey string) (*Handler, 
 	// config.json 默认 expiry_then_cheapest。
 	p.SetSelectionPolicy("expiry_then_cheapest")
 	h := NewHandler(Config{
-		Pool:                       p,
-		AdminEnabled:               true,
-		AdminManagementKey:         mgmtKey,
-		APIKey:                     apiKey,
-		SelectionPolicyConfigValue: "expiry_then_cheapest",
-		SelectionPolicyDataPath:    dataPath,
+		Pool: p,
+		// 选号端点独立开关（未通过验收修复交接 §4.2）：与 AdminEnabled 拆开，
+		// 本 helper 只启用选号面——账号状态写端点的注册与此无关。
+		AdminSelectionPolicyEnabled: true,
+		AdminManagementKey:          mgmtKey,
+		APIKey:                      apiKey,
+		SelectionPolicyConfigValue:  "expiry_then_cheapest",
+		SelectionPolicyDataPath:     dataPath,
 	})
 	return h, dataPath
 }
@@ -184,5 +186,85 @@ func TestLoadPersistedSelectionPolicyCorruptFallsBackEmpty(t *testing.T) {
 	}
 	if v := LoadPersistedSelectionPolicy(path); v != "" {
 		t.Fatalf("non-whitelist value returned %q", v)
+	}
+}
+
+// TestSelectionPolicyEndpointDisabled404 开关拆分（未通过验收修复交接 §4.2/§4.5）：
+// 选号端点未启用时路由不注册，GET/PUT 一律 404——即使 admin.enabled=true（账号
+// 写面开着）也不注册选号面；对未鉴权探测与真 404 不可区分。
+func TestSelectionPolicyEndpointDisabled404(t *testing.T) {
+	p := pool.New("")
+	p.SetSelectionPolicy("expiry_then_cheapest")
+	h := NewHandler(Config{
+		Pool:                       p,
+		AdminEnabled:               true, // 账号写面开着：选号面仍不得出现
+		AdminSelectionPolicyEnabled: false,
+		AdminManagementKey:         "mgmt-secret",
+		APIKey:                     "call-key",
+		SelectionPolicyConfigValue: "expiry_then_cheapest",
+	})
+	for _, tc := range []struct {
+		method, key, body string
+	}{
+		{http.MethodGet, "", ""},
+		{http.MethodGet, "mgmt-secret", ""},
+		{http.MethodGet, "call-key", ""},
+		{http.MethodPut, "", `{"selection_policy":"cheapest"}`},
+		{http.MethodPut, "mgmt-secret", `{"selection_policy":"cheapest"}`},
+		{http.MethodPut, "call-key", `{"selection_policy":"cheapest"}`},
+	} {
+		rec := doPolicy(t, h, tc.method, tc.key, tc.body)
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("%s key=%q code=%d want 404", tc.method, tc.key, rec.Code)
+		}
+	}
+	if got := h.cfg.Pool.SelectionPolicy(); got != "expiry_then_cheapest" {
+		t.Fatalf("disabled endpoint changed policy to %s", got)
+	}
+}
+
+// TestSelectionPolicyIndependentOfAdminWriteEndpoints 只开选号开关（admin.enabled
+// 关闭）时：选号 GET/PUT 用管理 Key 可用；三个账号状态修改端点不注册（404）——
+// 启用选号管理不顺带开放账号写面（未通过验收修复交接 §4.3）。
+func TestSelectionPolicyIndependentOfAdminWriteEndpoints(t *testing.T) {
+	p := pool.New("")
+	p.SetSelectionPolicy("expiry_then_cheapest")
+	h := NewHandler(Config{
+		Pool:                        p,
+		AdminEnabled:                false,
+		AdminSelectionPolicyEnabled: true,
+		AdminManagementKey:          "mgmt-secret",
+		APIKey:                      "call-key",
+		SelectionPolicyConfigValue:  "expiry_then_cheapest",
+		SelectionPolicyDataPath:     filepath.Join(t.TempDir(), "selection-policy.json"),
+	})
+	// 选号面可用（管理 Key 200）
+	if rec := doPolicy(t, h, http.MethodGet, "mgmt-secret", ""); rec.Code != http.StatusOK {
+		t.Fatalf("selection GET code=%d want 200", rec.Code)
+	}
+	// 账号状态写端点 404：无论匿名 / 调用 Key / 管理 Key，路由都未注册
+	for _, key := range []string{"", "call-key", "mgmt-secret"} {
+		req := httptest.NewRequest(http.MethodPost, "/admin/accounts/uid-x/disable", nil)
+		if key != "" {
+			req.Header.Set("Authorization", "Bearer "+key)
+		}
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("admin disable key=%q code=%d want 404", key, rec.Code)
+		}
+	}
+}
+
+// TestSelectionPolicySameValueKeysRejectedAtHandler 防御性同值检查（§4.5）：绕过
+// cmd/server 启动校验、直接构造 Config 把两把 Key 配成同值时，鉴权层必须独立拒绝
+// ——同值即无分权，管理面不得放行（即使请求带的就是那把"管理 Key"）。
+func TestSelectionPolicySameValueKeysRejectedAtHandler(t *testing.T) {
+	h, _ := newSelectionPolicyHandler(t, "same-key", "same-key")
+	for _, key := range []string{"same-key", "", "other"} {
+		rec := doPolicy(t, h, http.MethodGet, key, "")
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("same-value keys GET key=%q code=%d want 401", key, rec.Code)
+		}
 	}
 }

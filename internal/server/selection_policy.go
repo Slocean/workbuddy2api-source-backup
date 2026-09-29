@@ -47,11 +47,16 @@ type selectionPolicySnapshot struct {
 
 // withManagementKey 独立管理 Key 鉴权。与 withAuth（模型调用 Key）**互斥**：
 // 只比较 admin.management_key；普通调用 Key 即使合法也拿不到管理面。
-// Key 未配置时一律 401（不存在"未配置即放行"的退化路径）。
+// 除"未配置一律 401"外，再做**运行期同值防御**（未通过验收修复交接 §4.1）：
+// management_key 与 api_key 配成同值时直接拒绝——cmd/server 启动校验虽已拦截，
+// 但单元测试/嵌入式装配可绕过 Load 直接构造 Config，鉴权层必须独立兜底，
+// 不让"同值配置"在运行期拿到管理面。
 func (h *Handler) withManagementKey(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		key := strings.TrimSpace(h.cfg.AdminManagementKey)
-		if key == "" || !strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") {
+		callKey := strings.TrimSpace(h.cfg.APIKey)
+		if key == "" || (callKey != "" && key == callKey) ||
+			!strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") {
 			writeOpenAIError(w, http.StatusUnauthorized, "invalid_management_key",
 				"management key required")
 			return
@@ -95,8 +100,9 @@ func (h *Handler) selectionPolicyGet(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, h.selectionPolicyState())
 }
 
-// selectionPolicyPut 校验 → 锁定判定 → 持久化 → 运行时生效，任何一步失败
-// 都不改变现状（原子写：临时文件 + rename）。成功后 effective 立即为新值。
+// selectionPolicyPut 校验 → 锁定判定 → 串行互斥下「持久化 → 运行时生效」，
+// 任何一步失败都不改变现状（原子写：唯一临时文件 + 不删目标的替换，§5）。
+// 成功后 effective 立即为新值。
 func (h *Handler) selectionPolicyPut(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		SelectionPolicy string `json:"selection_policy"`

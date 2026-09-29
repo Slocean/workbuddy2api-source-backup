@@ -221,14 +221,16 @@ func main() {
 		PromptText:   cfg.PromptText,
 		// global realm 开关（handler 侧第三道闸：modelList 据此决定是否列 global 名单）。
 		GlobalEnabled: cfg.Global.Enabled,
-		// 运维管理端点开关（config admin.enabled，默认 false）。
+		// 运维管理端点开关（config admin.enabled，默认 false）：只控制账号状态写端点。
 		AdminEnabled: cfg.Admin.Enabled,
-		// 选号策略管理面（阶段 3.1）：独立管理 Key + 锁定/来源/持久化路径。
-		AdminManagementKey:        cfg.Admin.ManagementKey,
-		SelectionPolicyConfigValue: cfg.Pool.SelectionPolicy,
-		SelectionPolicyLocked:      selPolicyLocked,
-		SelectionPolicyEnvValue:    cfg.Pool.SelectionPolicy,
-		SelectionPolicyDataPath:    selPolicyPath,
+		// 选号策略管理面（阶段 3.1；开关拆分见未通过验收修复交接 §4.2）：
+		// 独立开关 + 独立管理 Key + 锁定/来源/持久化路径。
+		AdminSelectionPolicyEnabled: cfg.Admin.SelectionPolicyEnabled,
+		AdminManagementKey:          cfg.Admin.ManagementKey,
+		SelectionPolicyConfigValue:  cfg.Pool.SelectionPolicy,
+		SelectionPolicyLocked:       selPolicyLocked,
+		SelectionPolicyEnvValue:     cfg.Pool.SelectionPolicy,
+		SelectionPolicyDataPath:     selPolicyPath,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

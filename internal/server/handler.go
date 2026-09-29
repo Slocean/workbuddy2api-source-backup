@@ -48,15 +48,24 @@ type Config struct {
 	// （modelList 不列 global 名单）。
 	GlobalEnabled bool
 
-	// AdminEnabled 运维管理端点开关（config admin.enabled，默认 false）。
-	// 关闭时 /admin/* 一律 404（而非 403——不向外暴露"这里存在管理面"）。
+	// AdminEnabled 账号状态修改端点开关（config admin.enabled，默认 false）。
+	// 关闭时 /admin/accounts/{uid}/{disable,enable,revive} 一律 404（而非 403——
+	// 不向外暴露"这里存在管理面"）。
 	AdminEnabled bool
+
+	// AdminSelectionPolicyEnabled 选号策略管理端点独立开关（config
+	// admin.selection_policy_enabled，默认 false；未通过验收修复交接 §4.2）。
+	// 与 AdminEnabled 拆开：启用选号 GET/PUT 不顺带开放账号状态写端点；
+	// 两个开关全关时 /admin/* 一律 404。
+	AdminSelectionPolicyEnabled bool
 
 	// AdminManagementKey 选号策略管理端点的**独立**管理凭证
 	// （config admin.management_key / env WB2A_ADMIN_MANAGEMENT_KEY）。
 	// 与 APIKey（模型调用 Key）严格分离：/admin/pool/selection-policy 只认它，
 	// 调用 Key 即使合法也 401（修复清单 §3.1 凭证契约，本服务强制执行）。
-	// 空 = 选号管理端点对任何凭证都 401。
+	// 启用选号端点时必须非空且 ≠ APIKey（cmd/server 启动校验强制）；
+	// 未启用时空值合法（路由不注册）。withManagementKey 另有运行期同值防御，
+	// 直接构造 Config 绕过启动校验也无法用同值 Key 打通管理面。
 	AdminManagementKey string
 
 	// SelectionPolicyConfigValue config.json（或内置默认）的选号策略初始值。
@@ -136,8 +145,12 @@ func NewHandler(cfg Config) *Handler {
 		h.mux.HandleFunc("POST /admin/accounts/{uid}/disable", h.withAuth(h.adminAccountDisable))
 		h.mux.HandleFunc("POST /admin/accounts/{uid}/enable", h.withAuth(h.adminAccountEnable))
 		h.mux.HandleFunc("POST /admin/accounts/{uid}/revive", h.withAuth(h.adminAccountRevive))
-		// 选号策略管理（总反代平台阶段 3.1）：**独立管理 Key** 鉴权（withManagementKey），
-		// 与上面复用调用 Key 的账号状态端点不同——策略是路由控制面，凭证必须分离。
+	}
+	// 选号策略管理（总反代平台阶段 3.1）：**独立开关 + 独立管理 Key** 鉴权
+	// （withManagementKey），与 admin.enabled 控制的账号状态端点拆开注册
+	// （未通过验收修复交接 §4.2）——启用选号管理不再顺带开放账号写面，反之亦然。
+	// 未启用时路由不注册，对未鉴权探测与真 404 不可区分（同上 §2.3 纪律）。
+	if cfg.AdminSelectionPolicyEnabled {
 		h.mux.HandleFunc("GET /admin/pool/selection-policy", h.withManagementKey(h.selectionPolicyGet))
 		h.mux.HandleFunc("PUT /admin/pool/selection-policy", h.withManagementKey(h.selectionPolicyPut))
 	}

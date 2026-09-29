@@ -40,11 +40,18 @@ type Config struct {
 	// （withAuth + 同一个 api_key，不另立管理密钥）。
 	Admin struct {
 		Enabled bool `json:"enabled"` // 默认 false
+		// SelectionPolicyEnabled 选号策略管理端点（/admin/pool/selection-policy）
+		// 的**独立**开关（总反代平台未通过验收修复交接 §4.2）。与 admin.enabled
+		// 拆开：admin.enabled 只控制账号状态修改端点（disable/enable/revive），
+		// 本开关只注册选号 GET/PUT——启用选号管理不必顺带开放账号写面。
+		// 默认 false；env WB2A_SELECTION_POLICY_ADMIN_ENABLED 可覆盖。
+		SelectionPolicyEnabled bool `json:"selection_policy_enabled"`
 		// ManagementKey 选号策略管理端点（/admin/pool/selection-policy）的
 		// **独立**管理凭证（总反代平台阶段 3.1.1）。与 api_key（模型调用 Key）
-		// 严格分离：该端点只认它，调用 Key 一律 401。空 = 选号管理端点对任何
-		// 凭证都 401（Hub 侧显示"检查管理凭证"）。env WB2A_ADMIN_MANAGEMENT_KEY
-		// 可覆盖。不做启动 fail-fast：未配置只是该端点不可用，不影响其他管理面。
+		// 严格分离：该端点只认它，调用 Key 一律 401。env WB2A_ADMIN_MANAGEMENT_KEY
+		// 可覆盖。选号端点**未启用**时空值合法（路由不注册，404）；一旦启用
+		// （selection_policy_enabled=true），启动校验强制非空且与 api_key 不同值
+		// （fail-fast，见 normalize）——同值配置不是分权，是权限串味。
 		ManagementKey string `json:"management_key"`
 	} `json:"admin"`
 
@@ -316,6 +323,11 @@ func applyEnv(c *Config) {
 			c.Admin.Enabled = b
 		}
 	}
+	if v := os.Getenv("WB2A_SELECTION_POLICY_ADMIN_ENABLED"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.Admin.SelectionPolicyEnabled = b
+		}
+	}
 	if v := os.Getenv("WB2A_ADMIN_MANAGEMENT_KEY"); v != "" {
 		c.Admin.ManagementKey = v
 	}
@@ -421,6 +433,20 @@ func (c *Config) normalize() error {
 	// 两条入口最终状态一致拦截。
 	if c.Admin.Enabled && strings.TrimSpace(c.APIKey) == "" {
 		return fmt.Errorf("admin.enabled=true 但 api_key 为空：请设置 api_key 或将 admin.enabled 置 false")
+	}
+	// 选号管理端点启用时的分权校验（未通过验收修复交接 §4.1）：management_key 必须
+	// 非空且与 api_key **字节值不同**。缺 Key 启动 = 端点注册了却对任何凭证 401，
+	// 是配置错误不是安全降级，直接失败让部署方补齐；同值配置 = 调用 Key 持有者
+	// 自动获得策略控制权，分权形同虚设。报错只说字段名，不回显任何一方密钥。
+	// withManagementKey 另有运行期防御性同值拒绝（internal/server），两层独立成立。
+	if c.Admin.SelectionPolicyEnabled {
+		mk := strings.TrimSpace(c.Admin.ManagementKey)
+		if mk == "" {
+			return fmt.Errorf("admin.selection_policy_enabled=true 但 admin.management_key 为空：请设置独立管理 Key 或将 selection_policy_enabled 置 false")
+		}
+		if strings.TrimSpace(c.APIKey) != "" && mk == strings.TrimSpace(c.APIKey) {
+			return fmt.Errorf("admin.management_key 与 api_key 相同：选号管理必须使用与模型调用 Key 不同的独立凭证")
+		}
 	}
 	// 排程段归一（空数组回落默认、ActivityReportCount 归一、小时范围校验）
 	// 由 internal/config 统一实现，cmd/server 与 cmd/activity 共用同一份语义。
