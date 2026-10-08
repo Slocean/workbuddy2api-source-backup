@@ -78,7 +78,10 @@ type Config struct {
 	SelectionPolicyEnvValue string
 	// SelectionPolicyDataPath data/selection-policy.json 的绝对/相对路径
 	// （由 state.json 同目录推导）。空 = 不可持久化，PUT 返回 500。
-	SelectionPolicyDataPath string
+	SelectionPolicyDataPath   string
+	SelectionScopeConfigValue string
+	SelectionScopeLocked      bool
+	SelectionScopeEnvValue    string
 }
 
 // notFoundCooldown 上游 404 的固定短冷却时长。
@@ -540,6 +543,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// bareModel 用于选号/粘性/账本/出站 body 重写（前缀是网关侧路由协议，上游只认裸名）。
 	// 裸名 → ("cn", 原串)，CN 现状零回归。
 	realm, bareModel := resolveModel(peek.Model)
+	hardRealm := r.Header.Get("X-ProxyHub-Allowed-Realm")
+	if hardRealm != "" && hardRealm != "cn" && hardRealm != "global" {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_realm", "invalid allowed realm")
+		return
+	}
+	allowAccount := h.scopeCompatibility(body, bareModel, realm)
 
 	// 请求级统计：出口即打一行表格日志（任何路径都会走到）。
 	st := newChatStat(time.Now(), body, peek.Stream)
@@ -571,12 +580,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		// 恒剥出 realm=cn，跨 realm 粘性会话会被错误钉回 CN 集合；完整前缀才能让
 		// 闭包正确过滤到 global 集合（见 cmd/server/wiring.go realmAwareAvailableForModel）。
 		// 模型名也参与成本账本与选号过滤，不能用 "-" 占位污染模型键。
-		if h.cfg.Pool.SelectionPolicy() == "balanced" {
+		if h.cfg.Pool.SelectionScope() == "" && hardRealm == "" && h.cfg.Pool.SelectionPolicy() == "balanced" {
 			if uid, ok := h.cfg.Session.ResolveForModel(stickyKey, peek.Model); ok {
 				stickyUID = uid
 			}
 		} else if uid, ok := h.cfg.Session.ExistingForModel(stickyKey, peek.Model); ok {
-			if h.cfg.Pool.PolicyAllowsSticky(uid, bareModel, realm) {
+			if h.cfg.Pool.ScopeAllowsSticky(uid, bareModel, realm, hardRealm, allowAccount) {
 				stickyUID = uid
 			} else {
 				h.cfg.Session.Unbind(stickyKey)
@@ -691,7 +700,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		var acct *auth.Auth
 		if stickyUID != "" {
 			acct = h.cfg.Pool.PickByUIDForModel(stickyUID, bareModel)
-			if acct == nil || (realm != "" && acct.Realm() != realm) {
+			if acct == nil || tried[stickyUID] || !h.cfg.Pool.ScopeAllowsSticky(stickyUID, bareModel, realm, hardRealm, allowAccount) {
+				acct = nil
 				// 粘性号在当前模型不可用（冷却/占满/该模型被 6004 限额）或 realm 不符 → 解绑。
 				unbindSticky()
 			}
@@ -699,7 +709,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		if acct == nil {
 			// 模型感知 + realm 感知选号：模型非空时启用 6004 模型级冷却豁免
 			// （healthyForModel），realm 谓词过滤跨域账号。
-			acct = h.cfg.Pool.PickExcludingForRealm(tried, bareModel, realm)
+			acct = h.cfg.Pool.PickForScope(tried, bareModel, realm, hardRealm, allowAccount)
 		}
 		if acct == nil {
 			st.status = http.StatusServiceUnavailable
@@ -1035,6 +1045,7 @@ func setAccountAttributionHeader(w http.ResponseWriter, acct *auth.Auth) {
 	}
 	w.Header().Set(attributionUIDHeader, uid)
 	w.Header().Set(attributionSourceHeader, "actual")
+	w.Header().Set("X-ProxyHub-Account-Realm", acct.Realm())
 }
 
 // rotateBackoff 轮转间指数退避 + 抖动（WAF 403 修复 P0-2，报告 §6）：

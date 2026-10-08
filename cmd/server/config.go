@@ -153,6 +153,7 @@ type Config struct {
 		// 空值回落默认。
 		CostExploreInterval string `json:"cost_explore_interval"`
 		SelectionPolicy     string `json:"selection_policy"`
+		SelectionScope      string `json:"selection_scope"`
 	} `json:"pool"`
 
 	SessionSticky struct {
@@ -315,6 +316,9 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("WB2A_EXPIRING_SOON"); v != "" {
 		c.Pool.ExpiringSoon = v
 	}
+	if v := os.Getenv("WB2A_SELECTION_SCOPE"); v != "" {
+		c.Pool.SelectionScope = v
+	}
 	if v := os.Getenv("WB2A_SELECTION_POLICY"); v != "" {
 		c.Pool.SelectionPolicy = v
 	}
@@ -407,6 +411,11 @@ func (c *Config) normalize() error {
 	}
 	if c.CostExploreIntervalDur < 0 {
 		c.CostExploreIntervalDur = 0
+	}
+	switch c.Pool.SelectionScope {
+	case "", "prefer_global", "prefer_cn", "all":
+	default:
+		return fmt.Errorf("pool.selection_scope: invalid value %q", c.Pool.SelectionScope)
 	}
 	switch c.Pool.SelectionPolicy {
 	case "balanced", "cheapest", "earliest_expiry", "expiry_then_cheapest", "cheapest_then_expiry":

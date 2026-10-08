@@ -37,6 +37,9 @@ func (p *Pool) Pick(model string) *auth.Auth {
 // 注意：模型豁免只进 normal 选号（候选 healthy 判定）；全冷却兜底不参与模型豁免——
 // 兜底本来就是在"无任何 direct 可用"时的降级，切模型可用性已在 normal 阶段体现。
 func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
+	return p.pickFiltered(tried, reqModel, realm, "", "", nil, false)
+}
+func (p *Pool) pickFiltered(tried map[string]bool, reqModel, realm, requested, hard string, allow func(*auth.Auth) bool, scoped bool) *auth.Auth {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	now := time.Now()
@@ -64,7 +67,13 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 		}
 		cands = append(cands, e)
 	}
+	if scoped {
+		cands = p.scopeCandidates(cands, requested, hard, allow)
+	}
 	if len(cands) == 0 {
+		if scoped {
+			return p.pickScopeFallbackLocked(tried, reqModel, now, requested, hard, allow)
+		}
 		// 全冷却兜底：无 healthy 候选时，从冷却账号里选 until 最早到期的一个
 		// （熔断/冷却共用 expiry 口径，取较早截止者）。禁用的账号永不参与兜底。
 		return p.pickEarliestExpiryLocked(tried, now, realm)
@@ -247,7 +256,14 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 // CoolSoft 与熔断号允许参与（可能已恢复，失败成本仅一轮换）。
 // 被 tried 排除、在途占满的账号同样跳过（维持请求级轮换 + 租约语义）。无任何可用返回 nil。
 func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, realm string) *auth.Auth {
+	return p.pickFallbackLocked(tried, now, realm, "", "", "", nil, false)
+}
+func (p *Pool) pickScopeFallbackLocked(tried map[string]bool, model string, now time.Time, requested, hard string, allow func(*auth.Auth) bool) *auth.Auth {
+	return p.pickFallbackLocked(tried, now, "", model, requested, hard, allow, true)
+}
+func (p *Pool) pickFallbackLocked(tried map[string]bool, now time.Time, realm, model, requested, hard string, allow func(*auth.Auth) bool, scoped bool) *auth.Auth {
 	var best *entry
+	var cands []*entry
 	for uid, e := range p.byUID {
 		if tried != nil && tried[uid] {
 			continue
@@ -264,6 +280,19 @@ func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, re
 		if p.inFlightFull(e) {
 			continue
 		}
+		if scoped && p.selectionScope != "" {
+			if cd, ok := e.modelCooldowns[model]; ok && now.Before(cd.Until) {
+				continue
+			}
+		}
+		if !e.expiry(now).IsZero() {
+			cands = append(cands, e)
+		}
+	}
+	if scoped {
+		cands = p.scopeCandidates(cands, requested, hard, allow)
+	}
+	for _, e := range cands {
 		exp := e.expiry(now)
 		if exp.IsZero() {
 			continue

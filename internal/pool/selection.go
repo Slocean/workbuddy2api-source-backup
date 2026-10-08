@@ -4,6 +4,7 @@ import (
 	"math"
 	"sort"
 	"time"
+	"workbuddy2api/internal/auth"
 )
 
 // CreditExpiry is a package balance with a known, future expiration time.
@@ -178,6 +179,12 @@ func (p *Pool) preferredAccount(cands []*entry, model string, now time.Time) *en
 // PolicyAllowsSticky keeps an existing session binding while it is tied for
 // the best policy rank. A better account causes the caller to select again.
 func (p *Pool) PolicyAllowsSticky(uid, model, realm string) bool {
+	return p.policyAllowsSticky(uid, model, realm, "", "", nil, false)
+}
+func (p *Pool) ScopeAllowsSticky(uid, model, requested, hard string, allow func(*auth.Auth) bool) bool {
+	return p.policyAllowsSticky(uid, model, "", requested, hard, allow, true)
+}
+func (p *Pool) policyAllowsSticky(uid, model, realm, requested, hard string, allow func(*auth.Auth) bool, scoped bool) bool {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	now := time.Now()
@@ -189,6 +196,19 @@ func (p *Pool) PolicyAllowsSticky(uid, model, realm string) bool {
 	for _, e := range p.byUID {
 		if e.healthyForModel(now, model) && !p.inFlightFull(e) && (realm == "" || e.a.Realm() == realm) {
 			cands = append(cands, e)
+		}
+	}
+	if scoped {
+		cands = p.scopeCandidates(cands, requested, hard, allow)
+		found := false
+		for _, e := range cands {
+			if e == bound {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
 		}
 	}
 	best := p.preferredAccount(cands, model, now)

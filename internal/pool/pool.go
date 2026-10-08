@@ -13,6 +13,7 @@ import (
 
 type Pool struct {
 	selectionPolicy string
+	selectionScope  string
 	mu              sync.RWMutex
 	byUID           map[string]*entry
 	stateFp         string

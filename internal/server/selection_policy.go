@@ -24,6 +24,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"workbuddy2api/internal/pool"
 )
 
 // selectionPolicies 与 pool.SetSelectionPolicy 的白名单一致（两处必须同步修改）。
@@ -41,6 +42,12 @@ type selectionPolicySnapshot struct {
 	Current         string `json:"current"`
 	Effective       string `json:"effective"`
 	Source          string `json:"source"`
+	ScopeSupported  bool   `json:"scope_supported"`
+	ScopeCurrent    string `json:"scope_current"`
+	ScopeEffective  string `json:"scope_effective"`
+	ScopeSource     string `json:"scope_source"`
+	ScopeLocked     bool   `json:"scope_locked"`
+	PolicyLocked    bool   `json:"policy_locked"`
 	RestartRequired bool   `json:"restart_required"`
 	Version         string `json:"version"`
 }
@@ -87,8 +94,11 @@ func (h *Handler) selectionPolicySource() (current, source string) {
 // restart_required 恒 false（PUT 立即生效并持久化，无"内存变了重启丢"的形态）。
 func (h *Handler) selectionPolicyState() selectionPolicySnapshot {
 	current, source := h.selectionPolicySource()
+	scopeCurrent, scopeSource := h.selectionScopeSource()
 	return selectionPolicySnapshot{
-		Supported: true,
+		Supported:      true,
+		ScopeSupported: true, ScopeCurrent: scopeCurrent, ScopeEffective: h.cfg.Pool.SelectionScope(), ScopeSource: scopeSource,
+		ScopeLocked: h.cfg.SelectionScopeLocked, PolicyLocked: h.cfg.SelectionPolicyLocked,
 		Current:   current,
 		Effective: h.cfg.Pool.SelectionPolicy(),
 		Source:    source,
@@ -97,6 +107,8 @@ func (h *Handler) selectionPolicyState() selectionPolicySnapshot {
 }
 
 func (h *Handler) selectionPolicyGet(w http.ResponseWriter, r *http.Request) {
+	h.selPolicyMu.Lock()
+	defer h.selPolicyMu.Unlock()
 	writeJSON(w, http.StatusOK, h.selectionPolicyState())
 }
 
@@ -105,24 +117,23 @@ func (h *Handler) selectionPolicyGet(w http.ResponseWriter, r *http.Request) {
 // 成功后 effective 立即为新值。
 func (h *Handler) selectionPolicyPut(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		SelectionPolicy string `json:"selection_policy"`
+		SelectionPolicy *string `json:"selection_policy"`
+		SelectionScope  *string `json:"selection_scope"`
 	}
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<10)).Decode(&body); err != nil {
-		writeOpenAIError(w, http.StatusBadRequest, "invalid_request",
-			"body must be a JSON object with selection_policy")
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<10)).Decode(&body); err != nil || (body.SelectionPolicy == nil && body.SelectionScope == nil) {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "selection_policy or selection_scope required")
 		return
 	}
-	policy := strings.TrimSpace(body.SelectionPolicy)
-	if !selectionPolicies[policy] {
-		writeOpenAIError(w, http.StatusBadRequest, "invalid_selection_policy",
-			"selection_policy must be one of: balanced, cheapest, earliest_expiry, expiry_then_cheapest, cheapest_then_expiry")
+	if body.SelectionPolicy != nil && !selectionPolicies[strings.TrimSpace(*body.SelectionPolicy)] {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_selection_policy", "invalid selection_policy")
 		return
 	}
-	if h.cfg.SelectionPolicyLocked {
-		// 部署配置锁定：环境变量优先级最高，运行期改不动（Hub 显示"由部署配置锁定"）。
-		writeJSON(w, http.StatusConflict, map[string]string{
-			"detail": "selection policy is locked by deployment config (WB2A_SELECTION_POLICY)",
-		})
+	if body.SelectionScope != nil && (strings.TrimSpace(*body.SelectionScope) == "" || !pool.ValidSelectionScope(strings.TrimSpace(*body.SelectionScope))) {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_selection_scope", "selection_scope must be prefer_global, prefer_cn or all")
+		return
+	}
+	if (body.SelectionPolicy != nil && h.cfg.SelectionPolicyLocked) || (body.SelectionScope != nil && h.cfg.SelectionScopeLocked) {
+		writeJSON(w, http.StatusConflict, map[string]string{"detail": "requested field is locked by deployment config"})
 		return
 	}
 	if h.cfg.SelectionPolicyDataPath == "" {
@@ -134,12 +145,27 @@ func (h *Handler) selectionPolicyPut(w http.ResponseWriter, r *http.Request) {
 	// 响应各自如实反映自身写入结果，不出现文件/内存/响应三方不一致（§5.3）。
 	h.selPolicyMu.Lock()
 	defer h.selPolicyMu.Unlock()
-	if err := persistSelectionPolicy(h.cfg.SelectionPolicyDataPath, policy); err != nil {
+	policy, scope := h.cfg.Pool.SelectionPolicy(), h.cfg.Pool.SelectionScope()
+	if body.SelectionPolicy != nil {
+		policy = strings.TrimSpace(*body.SelectionPolicy)
+	}
+	if body.SelectionScope != nil {
+		scope = strings.TrimSpace(*body.SelectionScope)
+	}
+	persistPolicy, persistScope := policy, scope
+	// Editing the other field must not save an environment override into data.
+	if h.cfg.SelectionPolicyLocked {
+		persistPolicy = h.readPersistedSelectionPolicy()
+	}
+	if h.cfg.SelectionScopeLocked {
+		persistScope = LoadPersistedSelectionScope(h.cfg.SelectionPolicyDataPath)
+	}
+	if err := persistSelectionPolicy(h.cfg.SelectionPolicyDataPath, persistPolicy, persistScope); err != nil {
 		writeOpenAIError(w, http.StatusInternalServerError, "persist_failed",
 			"failed to persist selection policy: "+err.Error())
 		return
 	}
-	h.cfg.Pool.SetSelectionPolicy(policy)
+	h.cfg.Pool.SetSelectionConfig(policy, scope)
 	writeJSON(w, http.StatusOK, h.selectionPolicyState())
 }
 
@@ -180,11 +206,15 @@ var renameForPersist = os.Rename
 // 同一固定 .tmp 互相覆盖。本实现两者皆除：唯一临时文件互不干扰，替换不经过
 // "目标不存在"窗口。失败路径清理本次临时文件，旧目标保持原状（内容完整）；
 // 运行时策略是否随之保持由调用方负责（selectionPolicyPut 持锁且失败不 Set）。
-func persistSelectionPolicy(path, policy string) error {
-	doc, err := json.MarshalIndent(map[string]string{
+func persistSelectionPolicy(path, policy string, scope ...string) error {
+	fields := map[string]string{
 		"selection_policy": policy,
 		"updated_by":       "proxy-hub",
-	}, "", "  ")
+	}
+	if len(scope) > 0 {
+		fields["selection_scope"] = scope[0]
+	}
+	doc, err := json.MarshalIndent(fields, "", "  ")
 	if err != nil {
 		return err
 	}
@@ -249,4 +279,27 @@ func LoadPersistedSelectionPolicy(dataPath string) string {
 // constantTimeEqual 常量时间字符串比较（与 withAuth 同一防时序侧信道纪律）。
 func constantTimeEqual(a, b string) bool {
 	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
+}
+
+func (h *Handler) selectionScopeSource() (string, string) {
+	if h.cfg.SelectionScopeLocked {
+		return h.cfg.SelectionScopeEnvValue, "env:WB2A_SELECTION_SCOPE"
+	}
+	if v := LoadPersistedSelectionScope(h.cfg.SelectionPolicyDataPath); v != "" {
+		return v, "data/selection-policy.json"
+	}
+	return h.cfg.SelectionScopeConfigValue, "config.json"
+}
+func LoadPersistedSelectionScope(path string) string {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	var doc struct {
+		SelectionScope string `json:"selection_scope"`
+	}
+	if json.Unmarshal(raw, &doc) != nil || !pool.ValidSelectionScope(doc.SelectionScope) {
+		return ""
+	}
+	return doc.SelectionScope
 }
