@@ -108,6 +108,14 @@ type entry struct {
 	credits          int64
 	creditExpiries   []CreditExpiry
 	creditObservedAt time.Time
+	// creditPendingMicro 小数费用定点累计器（单位 1e-6 credit）。NoteModelCost 的
+	// 逐笔消耗在此累计、凑满整 credit 才落扣 credits/到期桶——逐笔四舍五入会把
+	// 每笔 ±0.5 累积成系统性错账，把最早到期积分提前掏空、earliest_expiry 选错号
+	// （量化证据见 Hub docs/验收证据/2026-10-10-聚合最早到期修复/）。权威余额刷新
+	// （SetCredits/SetCreditsDetailed/SetCreditsWithExpiries/ReenableIfCredits）
+	// 重置为 0（官方快照覆盖估算）；持久化随 creditObservedAt 同一新鲜度守卫恢复，
+	// 残余小数重启不丢、不跨快照复活。
+	creditPendingMicro int64
 	// creditsExpiring 即将过期（签到时按 expiringSoon 窗口判定）的可用积分子集，
 	// 是 credits 的一部分（credits = creditsExpiring + 长期积分）。选号权重对其
 	// 额外加成：优先消耗快过期积分，避免官方活动赠送的奖励积分到期作废
@@ -400,6 +408,9 @@ type stateAccount struct {
 	CreditsExpiring  int64          `json:"credits_expiring"`
 	CreditExpiries   []CreditExpiry `json:"credit_expiries,omitempty"`
 	CreditObservedAt time.Time      `json:"credit_observed_at,omitempty"`
+	// CreditPendingMicro 小数费用累计器的持久化镜像（entry.creditPendingMicro）。
+	// 仅在 CreditObservedAt 快照新鲜且值域合法（0 < v < 1 credit）时恢复。
+	CreditPendingMicro int64 `json:"credit_pending_micro,omitempty"`
 	// ModelCooldowns 6004 模型级独立冷却表（model → 冷却记录）。持久化：
 	// PR #96 把 6004 改成精确对齐上游重置墙钟后，单模型冷却可长达数小时，
 	// 跨重启是常态；不持久化导致每次重启 healthyForModel 失忆、重新踩一遍

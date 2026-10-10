@@ -20,6 +20,7 @@ func (p *Pool) SetCredits(uid string, credits int64) {
 	defer p.mu.Unlock()
 	if e, ok := p.byUID[uid]; ok {
 		e.credits = credits
+		e.creditPendingMicro = 0 // 权威余额覆盖估算：残余小数随之弃用
 		p.dirty.Store(true)
 	}
 }
@@ -38,6 +39,7 @@ func (p *Pool) SetCreditsDetailed(uid string, credits, expiring int64) {
 		}
 		e.credits = credits
 		e.creditsExpiring = expiring
+		e.creditPendingMicro = 0 // 权威余额覆盖估算：残余小数随之弃用
 		p.dirty.Store(true)
 	}
 }

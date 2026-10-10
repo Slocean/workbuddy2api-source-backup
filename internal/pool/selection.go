@@ -15,6 +15,25 @@ type CreditExpiry struct {
 
 const creditObservationTTL = 24 * time.Hour
 
+// creditMicroPerUnit 小数费用定点累计精度：1 credit = 1e6 微分（定点整数加减，
+// 避免 float 连加的边界漂移；单笔舍入误差 ≤0.5e-6 credit）。
+const creditMicroPerUnit = int64(1_000_000)
+
+// maxSafeCredit microFromCredit 的输入上界：×1e6 后仍远小于 int64 上限与 float64
+// 精确整数范围（2^53），巨值/+Inf 钳到该上界，杜绝 int64 溢出成负绕过扣减钳制。
+const maxSafeCredit = 1e9
+
+// microFromCredit 一笔消耗折成微分（四舍五入到 1e-6；NaN/负值拒绝为 0）。
+func microFromCredit(credit float64) int64 {
+	if !(credit >= 0) { // NaN 不满足任何比较，与负值一并拒绝
+		return 0
+	}
+	if credit > maxSafeCredit {
+		credit = maxSafeCredit
+	}
+	return int64(credit*float64(creditMicroPerUnit) + 0.5)
+}
+
 // SetSelectionPolicy switches the account ordering used after health, realm,
 // model cooldown, retry and in-flight filtering. The default remains balanced.
 func (p *Pool) SetSelectionPolicy(policy string) bool {
@@ -81,6 +100,8 @@ func (p *Pool) SetCreditsWithExpiries(uid string, credits, expiring int64, packa
 	e.creditsExpiring = expiring
 	e.creditExpiries = valid
 	e.creditObservedAt = now
+	// 权威快照覆盖估算：小数费用累计器是旧快照上的内插残余，一并弃用。
+	e.creditPendingMicro = 0
 	p.dirty.Store(true)
 }
 

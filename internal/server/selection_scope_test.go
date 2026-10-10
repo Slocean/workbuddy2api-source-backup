@@ -50,29 +50,69 @@ func TestScopePersistenceAndIndependentUpdates(t *testing.T) {
 		t.Fatal("legacy file not preserved")
 	}
 }
-func TestScopeCatalogCompatibility(t *testing.T) {
-	cn := &auth.Auth{Domain: "www.codebuddy.cn"}
-	global := &auth.Auth{Domain: "www.workbuddy.ai"}
-	infos := []upstream.ModelInfo{{ID: "shared", SupportsImages: true, SupportsToolCall: true}, {ID: "text"}}
-	allowed := catalogCompatibility("shared", "global", true, true, infos, []string{"shared"}, infos)
-	if !allowed(cn) || !allowed(global) {
-		t.Fatal("shared compatible model excluded")
+// TestCatalogAllowsEvidenceSemantics 每账号目录证据判定语义（2026-10-10 反例修复）：
+// 目录正命中=正证据（能力旗标把关）；完整目录缺失=权威否定；降级/未知缺失不构成
+// 支持也不构成否定——同域保留 legacy 文本语义，跨域仅同账号新鲜实际成功观测放行
+// 文本；图片/工具能力无目录证据不编造。
+func TestCatalogAllowsEvidenceSemantics(t *testing.T) {
+	fullWith := catalogEvidence{known: true, complete: true, infos: []upstream.ModelInfo{
+		{ID: "m1", SupportsImages: true, SupportsToolCall: true},
+		{ID: "text-only"},
+	}}
+	partial := catalogEvidence{known: true, complete: false, names: []string{"other"},
+		infos: []upstream.ModelInfo{{ID: "m1", SupportsImages: true}}}
+	unknown := catalogEvidence{}
+	fresh := catalogEvidence{freshSuccess: true}
+
+	// 完整目录正命中：能力旗标把关。
+	if !catalogAllows(fullWith, "m1", true, true, true) {
+		t.Fatal("complete catalog hit with capabilities must pass")
 	}
-	allowed = catalogCompatibility("missing", "global", false, false, infos, []string{"missing"}, nil)
-	if allowed(cn) || !allowed(global) {
-		t.Fatal("model absence not filtered")
+	if catalogAllows(fullWith, "text-only", true, false, true) {
+		t.Fatal("rich entry without image support must gate image requests")
 	}
-	allowed = catalogCompatibility("shared", "global", false, false, nil, nil, nil)
-	if allowed(cn) || !allowed(global) {
-		t.Fatal("unknown catalog authorized crossing")
+	// 完整目录缺失：权威否定——跨域/同域、即便有历史成功观测也一票排除。
+	if catalogAllows(fullWith, "missing", false, false, true) {
+		t.Fatal("complete catalog missing = authoritative negative (cross realm)")
 	}
-	allowed = catalogCompatibility("shared", "global", true, false, nil, []string{"shared"}, nil)
-	if allowed(global) {
-		t.Fatal("name-only catalog fabricated image support")
+	if catalogAllows(fullWith, "missing", false, false, false) {
+		t.Fatal("complete catalog missing = authoritative negative (same realm)")
 	}
-	allowed = catalogCompatibility("text", "cn", true, false, infos, nil, nil)
-	if allowed(cn) {
-		t.Fatal("image incompatible selected")
+	completeFresh := fullWith
+	completeFresh.freshSuccess = true
+	if catalogAllows(completeFresh, "missing", false, false, true) {
+		t.Fatal("fresh success must not override still-fresh complete catalog")
+	}
+	// 降级目录：命中按能力放行；缺失不构成支持——跨域不放行（除非新鲜成功观测）。
+	if !catalogAllows(partial, "m1", true, false, true) {
+		t.Fatal("partial catalog hit with image support must pass cross realm")
+	}
+	if catalogAllows(partial, "missing", false, false, true) {
+		t.Fatal("partial catalog missing must NOT authorize cross realm")
+	}
+	if !catalogAllows(partial, "missing", false, false, false) {
+		t.Fatal("same-realm legacy text semantics preserved for partial missing")
+	}
+	partialFresh := partial
+	partialFresh.freshSuccess = true
+	if !catalogAllows(partialFresh, "missing", false, false, true) {
+		t.Fatal("fresh per-account success closes the partial gap (text)")
+	}
+	if catalogAllows(partialFresh, "missing", true, false, true) {
+		t.Fatal("image capability without catalog evidence must not be fabricated")
+	}
+	// 未知目录：同域 legacy 文本保留；跨域不放行；有新鲜成功观测才放行文本。
+	if !catalogAllows(unknown, "m1", false, false, false) {
+		t.Fatal("unknown catalog same-realm legacy text preserved")
+	}
+	if catalogAllows(unknown, "m1", false, false, true) {
+		t.Fatal("unknown catalog must NOT authorize cross realm")
+	}
+	if !catalogAllows(fresh, "m1", false, false, true) {
+		t.Fatal("fresh per-account success is valid cross-realm positive evidence")
+	}
+	if catalogAllows(unknown, "m1", true, false, false) {
+		t.Fatal("image capability must not be fabricated from unknown catalog")
 	}
 }
 

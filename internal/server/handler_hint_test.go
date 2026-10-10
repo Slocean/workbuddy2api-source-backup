@@ -28,13 +28,16 @@ type hintEnvelope struct {
 }
 
 // seedModelsCache 把动态模型目录缓存置为指定条目（hintContext 只读缓存快照，
-// 测试隔离：测试前 seed、测试后 reset，见 resetModelsCache）。
+// 测试隔离：测试前 seed、测试后 reset，见 resetModelsCache）。目录按 UID 隔离后
+// hint 快照读各账号新鲜条目并集——seed 到任一 CN 账号条目即可。
 func seedModelsCache(infos []upstream.ModelInfo) {
-	dynamicModelsCache.Lock()
-	dynamicModelsCache.ids = infos
-	dynamicModelsCache.fetched = time.Now() // 热（TTL 内）
-	dynamicModelsCache.lastFail = time.Time{}
-	dynamicModelsCache.Unlock()
+	cnCatalogsCache.Lock()
+	cnCatalogsCache.entries["hint-seed"] = &cnCatalogEntry{
+		infos:    infos,
+		complete: true,
+		fetched:  time.Now(), // 热（TTL 内）
+	}
+	cnCatalogsCache.Unlock()
 }
 
 // imgBody11133 携带 image_url 的请求体（11133 场景：不支持图片的模型传图）。
@@ -361,11 +364,14 @@ func TestHasImagePart(t *testing.T) {
 func TestCachedModelsSnapshotZeroUpstreamCalls(t *testing.T) {
 	resetModelsCache()
 	defer resetModelsCache()
-	// 缓存置为「已过期」（fetched=过去时刻）。
-	dynamicModelsCache.Lock()
-	dynamicModelsCache.ids = []upstream.ModelInfo{{ID: "hy3", SupportsImages: true}}
-	dynamicModelsCache.fetched = time.Now().Add(-2 * dynamicModelsTTL)
-	dynamicModelsCache.Unlock()
+	// 缓存置为「已过期」（fetched=过去时刻，按 UID 隔离条目）。
+	cnCatalogsCache.Lock()
+	cnCatalogsCache.entries["a1"] = &cnCatalogEntry{
+		infos:    []upstream.ModelInfo{{ID: "hy3", SupportsImages: true}},
+		complete: true,
+		fetched:  time.Now().Add(-2 * dynamicModelsTTL),
+	}
+	cnCatalogsCache.Unlock()
 
 	calls := 0
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {

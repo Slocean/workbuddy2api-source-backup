@@ -260,12 +260,22 @@ func countsMapFrom(total, healthy, cooling, disabled, inFlightFull int) map[stri
 	}
 }
 
-// dynamicModelsCache 动态模型缓存。
-var dynamicModelsCache struct {
-	sync.RWMutex
-	ids      []upstream.ModelInfo
-	fetched  time.Time // 最近一次成功拉取时间
-	lastFail time.Time // 最近一次拉取失败时间（负缓存）
+// cnCatalogsCache CN 动态模型目录缓存，按账号 UID 隔离（1h TTL + 5min 负缓存）：
+// 不同账号的模型权限可能不同，A 账号的目录不得冒充 B 账号的选号证据
+// （2026-10-10 线上实证：共享单份缓存 + 降级窄表把整个 global 域排除）。
+// complete=false（主 /v3/config 失败、仅企业端点降级）表示名单不完整——
+// 缺失条目不构成「该账号不支持」的否定证据。
+var cnCatalogsCache = struct {
+	sync.Mutex
+	entries map[string]*cnCatalogEntry
+}{entries: map[string]*cnCatalogEntry{}}
+
+type cnCatalogEntry struct {
+	sync.Mutex
+	infos    []upstream.ModelInfo
+	complete bool
+	fetched  time.Time
+	lastFail time.Time
 }
 
 const (
@@ -473,45 +483,78 @@ func rewriteModel(body []byte, bare string) []byte {
 	return out
 }
 
-// fetchDynamicModels 从池中任一健康 CN 账号拉模型列表（含 contextWindow/maxTokens），缓存 1h。
+// fetchDynamicModels 从池中任一健康 CN 账号拉取**该账号自己的**模型列表
+// （含 contextWindow/maxTokens），按 UID 缓存 1h。
 // 拉取失败记录时间戳进入 5min 负缓存，冷却期内直接返回 nil（纯动态，无静态表兜底），
 // 避免反复打上游。
 // 只从 CN realm 账号拉取（PickExcludingForRealm(nil,"","cn")）：全局账号的模型列表
 // 未必与 CN 一致，动态模型表只服务 CN 前缀（global 走独立探测）。
 func (h *Handler) fetchDynamicModels() []upstream.ModelInfo {
-	dynamicModelsCache.RLock()
-	if len(dynamicModelsCache.ids) > 0 && time.Since(dynamicModelsCache.fetched) < dynamicModelsTTL {
-		out := dynamicModelsCache.ids
-		dynamicModelsCache.RUnlock()
-		return out
-	}
-	// 失败负缓存：冷却期内不再请求上游。
-	if !dynamicModelsCache.lastFail.IsZero() && time.Since(dynamicModelsCache.lastFail) < modelsFetchFailCooldown {
-		dynamicModelsCache.RUnlock()
-		return nil
-	}
-	dynamicModelsCache.RUnlock()
-
 	acct := h.cfg.Pool.PickExcludingForRealm(nil, "", "cn")
 	if acct == nil {
 		return nil
 	}
-	infos, err := h.cfg.Upstream.FetchModels(acct)
-	if err != nil || len(infos) == 0 {
-		// 拉取失败只进负缓存（5min lastFail），不 NoteError（P1-6/发现 6）：
-		// NoteError 喂的是 chat 熔断器，models 端点偶发 5xx 跨界惩罚 chat 通道
-		// 健康的账号；models 拉取失败 ≠ 账号 chat 不可用。
-		dynamicModelsCache.Lock()
-		dynamicModelsCache.lastFail = time.Now()
-		dynamicModelsCache.Unlock()
-		return nil
-	}
-	dynamicModelsCache.Lock()
-	dynamicModelsCache.ids = infos
-	dynamicModelsCache.fetched = time.Now()
-	dynamicModelsCache.lastFail = time.Time{} // 成功则清空负缓存
-	dynamicModelsCache.Unlock()
+	infos, _, _ := h.cnCatalogFor(acct)
 	return infos
+}
+
+// cnCatalogFor 返回该账号自己的 CN 目录证据（miss 时探测，按 UID 缓存）。
+// complete=false 表示主 /v3/config 失败、仅企业端点降级——名单不完整，缺失条目
+// 不构成否定证据（选号层 catalogAllows 按此区分）。known=false = 探测失败
+// （负缓存）或尚无数据。
+// 拉取失败只进负缓存（5min lastFail），不 NoteError（P1-6/发现 6）：
+// models 端点偶发 5xx 跨界惩罚 chat 通道健康的账号；models 拉取失败 ≠ 账号
+// chat 不可用。
+func (h *Handler) cnCatalogFor(a *auth.Auth) (infos []upstream.ModelInfo, complete, known bool) {
+	if a == nil {
+		return nil, false, false
+	}
+	cnCatalogsCache.Lock()
+	e := cnCatalogsCache.entries[a.UID]
+	if e == nil {
+		e = &cnCatalogEntry{}
+		cnCatalogsCache.entries[a.UID] = e
+	}
+	e.Lock()
+	if len(e.infos) > 0 && time.Since(e.fetched) < dynamicModelsTTL {
+		// 完整目录吃满 TTL；降级目录短冷却后即重试主路径恢复完整性。
+		if e.complete || time.Since(e.fetched) < modelsFetchFailCooldown {
+			infos, complete := e.infos, e.complete
+			e.Unlock()
+			cnCatalogsCache.Unlock()
+			return infos, complete, true
+		}
+	}
+	if !e.lastFail.IsZero() && time.Since(e.lastFail) < modelsFetchFailCooldown {
+		// 负缓存冷却期内：避免反复打上游，直接按失败处理（无静态回落）。
+		e.Unlock()
+		cnCatalogsCache.Unlock()
+		return nil, false, false
+	}
+	e.Unlock()
+	cnCatalogsCache.Unlock()
+
+	infos, complete, err := h.cfg.Upstream.FetchModelsDetailed(a)
+	if err != nil || len(infos) == 0 {
+		cnCatalogsCache.Lock()
+		if ee := cnCatalogsCache.entries[a.UID]; ee != nil {
+			ee.Lock()
+			ee.lastFail = time.Now()
+			ee.Unlock()
+		}
+		cnCatalogsCache.Unlock()
+		return nil, false, false
+	}
+	cnCatalogsCache.Lock()
+	ee := cnCatalogsCache.entries[a.UID]
+	ee.Lock()
+	ee.infos = infos
+	ee.complete = complete
+	ee.fetched = time.Now()
+	ee.lastFail = time.Time{}
+	ee.Unlock()
+	cnCatalogsCache.Unlock()
+	return infos, complete, true
 }
 
 func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
@@ -1295,15 +1338,27 @@ func (h *Handler) hintContext(bareModel string, hasImage bool) upstream.HintCont
 	return ctx
 }
 
-// cachedModelsSnapshot 只读模型目录缓存（TTL 内快照）；缓存冷/空 → nil。
-// 不发起任何上游调用（与 fetchDynamicModels 的差异点，见 hintContext 注释）。
+// cachedModelsSnapshot 只读 CN 模型目录缓存（各账号新鲜条目并集，同 ID 取先见者）；
+// 缓存冷/空 → nil。不发起任何上游调用、不挑号（与 cnCatalogFor 的差异点：
+// 那个在 miss 时触发探测）——hintContext 只读已有数据，不扰动选号节奏。
 func cachedModelsSnapshot() []upstream.ModelInfo {
-	dynamicModelsCache.RLock()
-	defer dynamicModelsCache.RUnlock()
-	if len(dynamicModelsCache.ids) == 0 || time.Since(dynamicModelsCache.fetched) >= dynamicModelsTTL {
-		return nil
+	cnCatalogsCache.Lock()
+	defer cnCatalogsCache.Unlock()
+	var out []upstream.ModelInfo
+	seen := map[string]bool{}
+	for _, e := range cnCatalogsCache.entries {
+		e.Lock()
+		if len(e.infos) > 0 && time.Since(e.fetched) < dynamicModelsTTL {
+			for _, mi := range e.infos {
+				if !seen[mi.ID] {
+					seen[mi.ID] = true
+					out = append(out, mi)
+				}
+			}
+		}
+		e.Unlock()
 	}
-	return dynamicModelsCache.ids
+	return out
 }
 
 // hintOf 末端错误透传的统一 hint 入口：kind + 上游原文 + 请求上下文 →

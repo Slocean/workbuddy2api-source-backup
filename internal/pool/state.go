@@ -125,6 +125,8 @@ func (p *Pool) ReenableIfCredits(uid string, remain int64) {
 		} else {
 			e.credits = remain
 		}
+		// 权威余额覆盖估算：小数费用累计器是旧快照上的内插残余，一并弃用。
+		e.creditPendingMicro = 0
 		p.dirty.Store(true)
 	}
 }
@@ -197,18 +199,29 @@ func (p *Pool) NoteModelCost(uid, model string, credit float64, tokens int) {
 	// 高权重直到打空撞 402；global 账号不签到，credits 曾是终身冻结。
 	// 签到仍定期覆盖（ReenableIfCredits/SetCreditsDetailed 以 authoritative 余额
 	// 重置），扣减只是两次签到之间的内插估计；credit=0（免费请求）不动余额。
+	//
+	// 小数费用定点累计：逐笔 int64(credit+0.5) 的 ±0.5 误差会累积成系统性错账、
+	// 把最早到期桶提前掏空（线上实证见证据目录），故累计到整 credit 才落扣，
+	// 残余小数留在累计器；权威刷新（SetCredits* 家族）以官方快照重置。
 	if credit > 0 {
-		d := int64(credit + 0.5) // 四舍五入，与测试口径一致（2.5 → 3）
-		if d > e.credits {
-			d = e.credits // 钳 0：扣穿（对账延迟/消费早于记账）不产生负余额
-		}
-		e.credits -= d
-		e.spendCreditExpiries(d)
-		if e.creditsExpiring > 0 {
-			if d > e.creditsExpiring {
-				d = e.creditsExpiring
+		e.creditPendingMicro += microFromCredit(credit)
+		d := e.creditPendingMicro / creditMicroPerUnit
+		if d > 0 {
+			e.creditPendingMicro -= d * creditMicroPerUnit
+			if d > e.credits {
+				// 估算余额见底：钳 0 防负并丢弃残余（权威刷新会重置）。
+				d = e.credits
+				e.creditPendingMicro = 0
 			}
-			e.creditsExpiring -= d
+			e.credits -= d
+			e.spendCreditExpiries(d)
+			if e.creditsExpiring > 0 {
+				x := d
+				if x > e.creditsExpiring {
+					x = e.creditsExpiring
+				}
+				e.creditsExpiring -= x
+			}
 		}
 	}
 	if e.modelCost == nil {

@@ -293,23 +293,30 @@ func (s *Scheduler) RunCheckinNow() {
 	if _, err := s.CheckinAll(); err != nil {
 		log.Printf("scheduled checkin skipped: %v", err)
 	}
-	s.RefreshGlobalCredits()
+	s.RefreshCredits()
 }
 
-// RefreshGlobalCredits reads billing balances without invoking the CN-only
-// check-in endpoint. It runs at startup and after scheduled CN check-ins.
-func (s *Scheduler) RefreshGlobalCredits() {
+// RefreshCredits reads billing balances via the read-only get-user-resource
+// endpoint for every enabled account with a token — CN and global alike — and
+// resets each authoritative snapshot (SetCreditsWithExpiries). It runs at
+// startup and after scheduled check-ins. Both realms need this outside the
+// check-in window: NoteModelCost only interpolates local estimates between
+// authoritative refreshes, and a CN account whose estimate drifted must not
+// wait for the next check-in to be corrected.
+// 不调用 DailyCheckin/RefreshToken/奖励/登录；不解除手动禁用（manualDisabled
+// 与冷却正交，ReenableIfCredits 只清冷却域）。
+func (s *Scheduler) RefreshCredits() {
 	for _, st := range s.cfg.Pool.List() {
 		if st.Disabled {
 			continue
 		}
 		a := s.cfg.Pool.AuthByUID(st.UID)
-		if a == nil || !a.IsGlobal() || a.AccessTokenValue() == "" {
+		if a == nil || a.AccessTokenValue() == "" {
 			continue
 		}
 		remain, buckets, err := s.cfg.Upstream.UserResourceDetailed(a, s.cfg.ExpiringSoonWindow)
 		if err != nil {
-			log.Printf("global user-resource %s: %v", logfmt.Label(st.UID, st.Nickname), err)
+			log.Printf("user-resource %s: %v", logfmt.Label(st.UID, st.Nickname), err)
 			continue
 		}
 		expiries := make([]pool.CreditExpiry, 0, len(buckets.Expiries))

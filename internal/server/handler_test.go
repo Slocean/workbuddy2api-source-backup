@@ -35,15 +35,60 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
-// resetModelsCache 清空 package 级动态模型缓存（测试隔离：fetchDynamicModels 是全包共享
-// 状态，不复位会导致 /v1/models 断言被先前测试的缓存污染——shuffle 下偶发失败）。
+// resetModelsCache 清空 package 级动态模型缓存（测试隔离：目录缓存按 UID 隔离且为
+// 全包共享状态，不复位会导致 /v1/models 与选号断言被先前测试的缓存污染）。
 func resetModelsCache() {
-	dynamicModelsCache.Lock()
-	dynamicModelsCache.ids = nil
-	dynamicModelsCache.fetched = time.Time{}
-	dynamicModelsCache.lastFail = time.Time{}
-	dynamicModelsCache.Unlock()
+	cnCatalogsCache.Lock()
+	cnCatalogsCache.entries = map[string]*cnCatalogEntry{}
+	cnCatalogsCache.Unlock()
 }
+
+// cnCatalogInfosLen 返回该账号 CN 目录缓存条目的模型数（-1 = 无条目）。
+func cnCatalogInfosLen(uid string) int {
+	cnCatalogsCache.Lock()
+	defer cnCatalogsCache.Unlock()
+	e := cnCatalogsCache.entries[uid]
+	if e == nil {
+		return -1
+	}
+	e.Lock()
+	defer e.Unlock()
+	return len(e.infos)
+}
+
+// cnCatalogLastFail 返回该账号目录负缓存时间戳（零值 = 未失败）。
+func cnCatalogLastFail(uid string) time.Time {
+	cnCatalogsCache.Lock()
+	defer cnCatalogsCache.Unlock()
+	e := cnCatalogsCache.entries[uid]
+	if e == nil {
+		return time.Time{}
+	}
+	e.Lock()
+	defer e.Unlock()
+	return e.lastFail
+}
+
+// cnCatalogBackdateLastFail 把该账号目录负缓存时间戳拨回 d 前（模拟冷却期结束）。
+func cnCatalogBackdateLastFail(uid string, d time.Duration) {
+	cnCatalogsCache.Lock()
+	defer cnCatalogsCache.Unlock()
+	e := cnCatalogsCache.entries[uid]
+	if e == nil {
+		return
+	}
+	e.Lock()
+	e.lastFail = time.Now().Add(-d)
+	e.Unlock()
+}
+
+// clearCNCatalog 清空该账号的 CN 目录缓存条目（等价旧单缓存清空）。
+func clearCNCatalog(uid string) {
+	cnCatalogsCache.Lock()
+	delete(cnCatalogsCache.entries, uid)
+	cnCatalogsCache.Unlock()
+}
+
 
 const sseOK = "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1753600000,\"model\":\"glm-5.2\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"你好\"}}]}\n\n" +
 	"data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1753600000,\"model\":\"glm-5.2\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\n" +
@@ -1142,11 +1187,7 @@ func TestModelsEndpoint(t *testing.T) {
 
 func TestModelsDynamic(t *testing.T) {
 	// 清缓存
-	dynamicModelsCache.Lock()
-	dynamicModelsCache.ids = nil
-	dynamicModelsCache.fetched = time.Time{}
-	dynamicModelsCache.lastFail = time.Time{}
-	dynamicModelsCache.Unlock()
+	resetModelsCache()
 
 	// 假上游返回动态模型（含 agents + maxInputTokens/maxOutputTokens）
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
@@ -1195,10 +1236,7 @@ func TestModelsDynamic(t *testing.T) {
 	}
 
 	// 第二次调用走缓存（把上游关掉也成功）
-	dynamicModelsCache.RLock()
-	cached := len(dynamicModelsCache.ids)
-	dynamicModelsCache.RUnlock()
-	if cached != 3 {
+	if cached := cnCatalogInfosLen("u1"); cached != 3 {
 		t.Errorf("cache not populated: %d", cached)
 	}
 }
@@ -1206,11 +1244,7 @@ func TestModelsDynamic(t *testing.T) {
 // TestModelsDynamicFetchFailEmpty 纯动态：上游 500 → 空列表（无静态回退）。
 func TestModelsDynamicFetchFailEmpty(t *testing.T) {
 	// 清缓存
-	dynamicModelsCache.Lock()
-	dynamicModelsCache.ids = nil
-	dynamicModelsCache.fetched = time.Time{}
-	dynamicModelsCache.lastFail = time.Time{}
-	dynamicModelsCache.Unlock()
+	resetModelsCache()
 
 	// 假上游 500
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
@@ -1238,11 +1272,7 @@ func TestModelsDynamicFetchFailEmpty(t *testing.T) {
 // 跨界惩罚会让上游 models 端点偶发 5xx 把好号提前打进熔断。失败只进 5min 负缓存。
 func TestModelsFetchFailureDoesNotPenalizeAccount(t *testing.T) {
 	// 清缓存
-	dynamicModelsCache.Lock()
-	dynamicModelsCache.ids = nil
-	dynamicModelsCache.fetched = time.Time{}
-	dynamicModelsCache.lastFail = time.Time{}
-	dynamicModelsCache.Unlock()
+	resetModelsCache()
 
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
 	p.SetBreaker(1, time.Hour, time.Hour) // 熔断阈值 1：若误喂 NoteError 一次即熔断
@@ -1268,9 +1298,7 @@ func TestModelsFetchFailureDoesNotPenalizeAccount(t *testing.T) {
 		t.Errorf("models fetch failure should not record err_total: %d", st.ErrTotal)
 	}
 	// 负缓存仍然生效：拉取失败进 lastFail（5min 冷却）。
-	dynamicModelsCache.RLock()
-	failTs := dynamicModelsCache.lastFail
-	dynamicModelsCache.RUnlock()
+	failTs := cnCatalogLastFail("u1")
 	if failTs.IsZero() {
 		t.Error("negative cache (lastFail) should be set on fetch failure")
 	}
@@ -1278,11 +1306,7 @@ func TestModelsFetchFailureDoesNotPenalizeAccount(t *testing.T) {
 
 func TestModelsNegativeCacheOnFetchFailure(t *testing.T) {
 	// 清缓存
-	dynamicModelsCache.Lock()
-	dynamicModelsCache.ids = nil
-	dynamicModelsCache.fetched = time.Time{}
-	dynamicModelsCache.lastFail = time.Time{}
-	dynamicModelsCache.Unlock()
+	resetModelsCache()
 
 	// v3-config-merge：单次 fetch 并发打企业端点 + /v3/config，计数须并发安全。
 	var mu sync.Mutex
@@ -1311,9 +1335,7 @@ func TestModelsNegativeCacheOnFetchFailure(t *testing.T) {
 	}
 
 	// 冷却期结束（把失败时间戳拨回 10 分钟前）→ 应重新 fetch。
-	dynamicModelsCache.Lock()
-	dynamicModelsCache.lastFail = time.Now().Add(-10 * time.Minute)
-	dynamicModelsCache.Unlock()
+	cnCatalogBackdateLastFail("u1", 10*time.Minute)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("GET", "/v1/models", nil))
 	if rec.Code != 200 {

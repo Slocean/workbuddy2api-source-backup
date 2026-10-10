@@ -44,13 +44,17 @@ var GlobalModelNames = []string{
 	"kimi-k2.6",
 }
 
-// fetchGlobalModelsCache 探测结果缓存（语义参照 CN 侧 handler.dynamicModelsCache：1h TTL +
-// 5min 失败负缓存）。按 Client 实例持有（effortsMu 同模式），测试新建 Client 即隔离。
-// Mutex 内嵌，与 modelList 无并发读路径竞争（唯一读写点本文件内）。
+// fetchGlobalModelsCache 单个 global 账号的目录探测缓存（语义参照 CN 侧目录缓存：
+// 1h TTL + 5min 失败负缓存）。按账号 UID 隔离——不同 global 账号的模型权限可能
+// 不同，A 账号的目录不得冒充 B 账号的选号证据（2026-10-10 线上实证：共享单份
+// 缓存 + 降级窄表把真实支持 DeepSeek 的账号整域排除）。
+// complete=false 表示主路径 /v3/config 失败、仅企业端点降级成功：名单**不完整**，
+// 缺失条目不构成「该账号不支持」的否定证据（完整目录缺失才是）。
 type fetchGlobalModelsCache struct {
 	sync.Mutex
 	names    []string    // 成功缓存：探测结果（已去重）；nil = 未探测/失败
 	infos    []ModelInfo // 成功缓存：探测对象形态的全字段条目（窄表/失败形态为 nil）
+	complete bool        // 主路径 /v3/config 与企业端点双双成功（名单完整可用作否定证据）
 	fetched  time.Time
 	lastFail time.Time
 }
@@ -72,73 +76,122 @@ var globalModelsProbePaths = []string{
 	"/console/enterprises/personal/models",
 }
 
-// FetchGlobalModels 探测 global 账号的模型名目录并返回模型名列表（含 context 无关、无倍率）。
+// FetchGlobalModels 探测该账号自己的 global 模型名目录并返回模型名列表（含 context 无关、无倍率）。
 //
-// 纯动态：成功返回探测结果（去重），缓存 1h；失败（家族端点全非 2xx / 解析失败 /
+// 纯动态：成功返回探测结果（去重），按账号 UID 缓存 1h；失败（家族端点全非 2xx / 解析失败 /
 // 空列表）记 5min 负缓存，返回 nil（无静态回落）。缓存/负缓存命中：直接返回，零上游调用。
+// 目录按 UID 隔离（GlobalCatalog）：A 账号的名单不冒充 B 账号的权限。
 //
 // 调用方负责：仅在有 global 账号时调用（无则不探测）；GlobalEnabled 关闭时（逃生门）
 // 不得调用——本方法由 globalOn(a) 内部兜底，若账号因开关回落 cn 则返回 nil。
 func (c *Client) FetchGlobalModels(a *auth.Auth) []string {
-	names, _ := c.fetchGlobalModelsOnce(a)
+	names, _, _, _ := c.GlobalCatalog(a)
 	return names
 }
 
-// FetchGlobalModelInfos 探测 global 账号的模型目录并返回全字段 ModelInfo 列表
+// FetchGlobalModelInfos 探测该账号自己的 global 模型目录并返回全字段 ModelInfo 列表
 // （global /v2 模型对象与 CN 同构，2026-09-15 真实账号 /v2 探测实证）。
-// 与 FetchGlobalModels 共享同一次探测与缓存（names + infos 一体落缓存）：
+// 与 GlobalCatalog 共享同一次探测与缓存（names + infos 一体落缓存）：
 // 对象形态 200 → 全字段条目；窄表形态 / 探测失败 / 负缓存 / 非 global 路由账号
 // → nil（调用方按 ID 名单输出裸条目，不编造字段）。
 // 账号因 GlobalEnabled 开关回落 cn 时不探测（globalOn 兜底，零上游调用）。
 func (c *Client) FetchGlobalModelInfos(a *auth.Auth) []ModelInfo {
-	_, infos := c.fetchGlobalModelsOnce(a)
+	_, infos, _, _ := c.GlobalCatalog(a)
 	return infos
 }
 
-// GlobalModelInfosSnapshot 只读 global 模型目录全字段缓存（TTL 内快照）；
+// GlobalCatalog 返回该账号自己的 global 目录证据（探测结果按 UID 缓存）。
+//   - known=true：本次或缓存中有可用名单（complete 与否见下）；
+//   - complete=true：/v3/config 与企业端点双双成功——名单完整，缺失条目可作为
+//     「该账号不支持」的否定证据；
+//   - complete=false：主路径失败、仅企业端点降级（或窄表形态）——名单不完整，
+//     缺失条目**不构成**否定证据（调用方不得据此排除账号）。
+// 账号因 GlobalEnabled 开关回落 cn 时不探测（globalOn 兜底），known=false。
+func (c *Client) GlobalCatalog(a *auth.Auth) (names []string, infos []ModelInfo, complete, known bool) {
+	names, infos, complete = c.fetchGlobalModelsOnce(a)
+	known = names != nil
+	return names, infos, complete, known
+}
+
+// GlobalModelInfosSnapshot 只读 global 目录全字段缓存（TTL 内快照）；
 // 冷 / 过期 / 窄表形态 / 未探测 → nil。不发起任何上游探测——与
 // FetchGlobalModelInfos 的差异点（那个在 miss 时触发探测，服务 /v1/models；
 // 本方法服务 /v1/stats 的倍率透出，只读已有数据）。
+// 目录按 UID 隔离后，此处返回各账号新鲜条目的并集（同 ID 取先见者；仅展示）。
 func (c *Client) GlobalModelInfosSnapshot() []ModelInfo {
-	c.globalModels.Lock()
-	defer c.globalModels.Unlock()
-	if len(c.globalModels.infos) == 0 || time.Since(c.globalModels.fetched) >= globalModelsTTL {
-		return nil
+	c.globalCatalogsMu.Lock()
+	defer c.globalCatalogsMu.Unlock()
+	var out []ModelInfo
+	seen := map[string]bool{}
+	for _, e := range c.globalCatalogs {
+		e.Lock()
+		if len(e.infos) == 0 || time.Since(e.fetched) >= globalModelsTTL {
+			e.Unlock()
+			continue
+		}
+		for _, mi := range e.infos {
+			if !seen[mi.ID] {
+				seen[mi.ID] = true
+				out = append(out, mi)
+			}
+		}
+		e.Unlock()
 	}
-	return c.globalModels.infos
+	return out
 }
 
-// fetchGlobalModelsOnce 单次探测决策（缓存命中/负缓存/触发探测），返回 (names, infos)。
-// 纯动态：成功 = 探测结果去重（不与任何静态名单合并）；一切失败 = nil（不回落静态）。
+// fetchGlobalModelsOnce 单账号单次探测决策（缓存命中/负缓存/触发探测），按 UID 隔离。
+// 返回 (names, infos, complete)；纯动态：成功 = 探测结果去重（不与任何静态名单合并）；
+// 一切失败 = nil（不回落静态）。complete 仅在 /v3/config 与企业端点双双成功时为 true。
 // infos 仅对象形态成功探测时非 nil。
-func (c *Client) fetchGlobalModelsOnce(a *auth.Auth) (names []string, infos []ModelInfo) {
+func (c *Client) fetchGlobalModelsOnce(a *auth.Auth) (names []string, infos []ModelInfo, complete bool) {
 	if !c.globalOn(a) {
 		// 逃生门兜底：账号不路由 global 上游 → 不探测（零上游调用）。
-		return nil, nil
+		return nil, nil, false
 	}
 
-	c.globalModels.Lock()
-	if len(c.globalModels.names) > 0 && time.Since(c.globalModels.fetched) < globalModelsTTL {
-		names, infos := c.globalModels.names, c.globalModels.infos
-		c.globalModels.Unlock()
-		return names, infos
+	c.globalCatalogsMu.Lock()
+	entry := c.globalCatalogs[a.UID]
+	if entry == nil {
+		entry = &fetchGlobalModelsCache{}
+		if c.globalCatalogs == nil {
+			c.globalCatalogs = make(map[string]*fetchGlobalModelsCache)
+		}
+		c.globalCatalogs[a.UID] = entry
 	}
-	if !c.globalModels.lastFail.IsZero() && time.Since(c.globalModels.lastFail) < globalModelsFailCooldown {
+	entry.Lock()
+	if len(entry.names) > 0 && time.Since(entry.fetched) < globalModelsTTL {
+		// 完整目录吃满 TTL；降级目录短冷却后即重试主路径——恢复完整性，
+		// 不让一次瞬时超时的窄表霸占 1h。
+		if entry.complete || time.Since(entry.fetched) < globalModelsFailCooldown {
+			names, infos, complete := entry.names, entry.infos, entry.complete
+			entry.Unlock()
+			c.globalCatalogsMu.Unlock()
+			return names, infos, complete
+		}
+	}
+	if !entry.lastFail.IsZero() && time.Since(entry.lastFail) < globalModelsFailCooldown {
 		// 负缓存冷却期内：避免反复打上游，直接按失败处理（无静态回落）。
-		c.globalModels.Unlock()
-		return nil, nil
+		entry.Unlock()
+		c.globalCatalogsMu.Unlock()
+		return nil, nil, false
 	}
-	c.globalModels.Unlock()
+	entry.Unlock()
+	c.globalCatalogsMu.Unlock()
 
-	names, infos, efforts, defaults, err := c.probeGlobalModels(a)
+	names, infos, efforts, defaults, complete, err := c.probeGlobalModels(a)
 	if err != nil || len(names) == 0 {
 		// 探测失败：负缓存 + 返回 nil（effort 桶不写，prepareBody 走 globalEffortMap 静态兜底）。
-		c.globalModels.Lock()
-		c.globalModels.lastFail = time.Now()
-		c.globalModels.names = nil
-		c.globalModels.infos = nil
-		c.globalModels.Unlock()
-		return nil, nil
+		c.globalCatalogsMu.Lock()
+		e := c.globalCatalogs[a.UID]
+		e.Lock()
+		e.lastFail = time.Now()
+		e.names = nil
+		e.infos = nil
+		e.complete = false
+		e.Unlock()
+		c.globalCatalogsMu.Unlock()
+		return nil, nil, false
 	}
 	// global 域 effort 能力：探测下发的 supportedEfforts/defaultEffort 权威写入 global 桶
 	// （raw remote，不并入静态表——静态兜底在 prepareBody 的 globalEffortMap 与
@@ -159,24 +212,30 @@ func (c *Client) fetchGlobalModelsOnce(a *auth.Auth) (names []string, infos []Mo
 		merged = append(merged, id)
 	}
 
-	c.globalModels.Lock()
-	c.globalModels.names = merged
-	c.globalModels.infos = infos
-	c.globalModels.fetched = time.Now()
-	c.globalModels.lastFail = time.Time{}
-	c.globalModels.Unlock()
-	return merged, infos
+	c.globalCatalogsMu.Lock()
+	e := c.globalCatalogs[a.UID]
+	e.Lock()
+	e.names = merged
+	e.infos = infos
+	e.complete = complete
+	e.fetched = time.Now()
+	e.lastFail = time.Time{}
+	e.Unlock()
+	c.globalCatalogsMu.Unlock()
+	return merged, infos, complete
 }
 
 // probeGlobalModels 发起一次 global 模型目录探测（v3-config-merge）：
 // /v3/config（主）与企业端点家族（/v2 → /console 兜底，补缺）**并发**探测后并集合并。
 // 返回模型名列表（已合并、未再去重——去重在 fetchGlobalModelsOnce）、全字段
 // ModelInfo（对象形态；窄表为 nil）及 effort 能力桶（supportedEfforts/defaultEffort，
-// 可为空）。合并口径：v3 条目为主（credits 等字段以 v3 为准），企业端点只补 v3 缺失的
-// 模型 id（如 gpt-5.3-codex 只在 /v2，作为补充进并集）；去重 key = 模型 id，输出顺序
-// 稳定（v3 原序在前、企业端点补充项在后）。两路全失败才返回错误（等价原「家族端点全
-// 非 2xx」负缓存语义）；单路失败降级为另一路结果 + warn 日志，互不拖累。
-func (c *Client) probeGlobalModels(a *auth.Auth) (names []string, infos []ModelInfo, efforts map[string][]string, defaults map[string]string, err error) {
+// 可为空）。complete 仅当 /v3/config 与企业端点双双成功——主路径失败时并集只是
+// 降级窄表，名单缺失不构成否定证据。合并口径：v3 条目为主（credits 等字段以 v3 为准），
+// 企业端点只补 v3 缺失的模型 id（如 gpt-5.3-codex 只在 /v2，作为补充进并集）；
+// 去重 key = 模型 id，输出顺序稳定（v3 原序在前、企业端点补充项在后）。两路全失败才返回
+// 错误（等价原「家族端点全非 2xx」负缓存语义）；单路失败降级为另一路结果 + warn 日志，
+// 互不拖累。
+func (c *Client) probeGlobalModels(a *auth.Auth) (names []string, infos []ModelInfo, efforts map[string][]string, defaults map[string]string, complete bool, err error) {
 	type probeResult struct {
 		names    []string
 		infos    []ModelInfo
@@ -208,23 +267,23 @@ func (c *Client) probeGlobalModels(a *auth.Auth) (names []string, infos []ModelI
 	enterprise := <-enterpriseCh
 
 	if v3.err != nil && enterprise.err != nil {
-		// 两路全失败 → 负缓存语义（等价原家族端点全非 2xx）。
-		return nil, nil, nil, nil, v3.err
+		// 两路全失败 → 负缓存语义（等价原「家族端点全非 2xx」）。
+		return nil, nil, nil, nil, false, v3.err
 	}
 	if v3.err != nil {
 		// /v3 失败降级：不拖累企业端点结果（任务书实现要点：降级仅企业端点 + warn）。
 		log.Printf("WARN: [upstream] global models: v3/config probe failed (degraded to enterprise endpoint): %v", v3.err)
-		return enterprise.names, enterprise.infos, enterprise.efforts, enterprise.defaults, nil
+		return enterprise.names, enterprise.infos, enterprise.efforts, enterprise.defaults, false, nil
 	}
 	if enterprise.err != nil {
 		log.Printf("WARN: [upstream] global models: enterprise endpoint failed (v3/config only): %v", enterprise.err)
-		return v3.names, v3.infos, v3.efforts, v3.defaults, nil
+		return v3.names, v3.infos, v3.efforts, v3.defaults, false, nil
 	}
 	// 两路皆成功：v3 为主、企业端点补缺合并。
 	names, infos = mergeGlobalCatalog(v3.names, v3.infos, enterprise.names, enterprise.infos)
 	efforts = mergeEffortBuckets(v3.efforts, enterprise.efforts)
 	defaults = mergeEffortDefaults(v3.defaults, enterprise.defaults)
-	return names, infos, efforts, defaults, nil
+	return names, infos, efforts, defaults, true, nil
 }
 
 // mergeGlobalCatalog 两路合并（v3 主、企业补缺）：names 按 id 去重（v3 原序在前、

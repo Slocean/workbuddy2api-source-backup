@@ -187,6 +187,12 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 		}
 		if !s.CreditObservedAt.IsZero() && now.Sub(s.CreditObservedAt) <= creditObservationTTL {
 			e.creditObservedAt = s.CreditObservedAt
+			// 小数费用累计器只对恢复的这份快照有意义：同一新鲜度守卫内恢复，
+			// 且值域必须合法（0 < v < 1 credit——落扣后残余恒小于整 credit）；
+			// 负值/超范围脏数据直接弃用，不让错账复活。
+			if s.CreditPendingMicro > 0 && s.CreditPendingMicro < creditMicroPerUnit {
+				e.creditPendingMicro = s.CreditPendingMicro
+			}
 			var known int64
 			for _, item := range s.CreditExpiries {
 				if item.Remaining <= 0 || !item.Expiry.After(now) || known >= e.credits {
@@ -448,6 +454,7 @@ func (p *Pool) stateOverviewLocked() stateFile {
 			CreditsExpiring:  e.creditsExpiring,
 			CreditExpiries:   append([]CreditExpiry(nil), e.creditExpiries...),
 			CreditObservedAt: e.creditObservedAt,
+			CreditPendingMicro: e.creditPendingMicro,
 			ModelCooldowns:   mcs,
 			ModelCosts:       mcosts,
 		}

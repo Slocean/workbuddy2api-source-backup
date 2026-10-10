@@ -20,14 +20,23 @@ import (
 
 // TestNoteModelCostDeductsCredits chat 成功带 credit 时（本次消耗），credits 顺带扣减。
 // 任务书 §P1-A：credit 是本次请求消耗的积分（handler.go stats.Credit()），不是余额。
+// 小数费用定点累计（fractional-credit 修复）：2.5 只落扣整部分 2，0.5 留在累计器
+// 随后续消耗凑整——逐笔四舍五入会把每笔 ±0.5 累积成系统性错账（实测 141 笔
+// 78.13 被扣 115，最早到期桶被提前掏空）。
 func TestNoteModelCostDeductsCredits(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
 	p.SetCredits("u1", 100)
-	p.NoteModelCost("u1", "m", 2.5, 1000) // 本次消耗 2.5
+	p.NoteModelCost("u1", "m", 2.5, 1000) // 本次消耗 2.5：整 2 落扣，0.5 留累计器
 	st, _ := p.Status("u1")
-	if st.Credits != 97 {
-		t.Errorf("credits=%d want 97（100 - 2.5 四舍五入=3，扣减）", st.Credits)
+	if st.Credits != 98 {
+		t.Errorf("credits=%d want 98（100 - 整部分 2，0.5 留累计器）", st.Credits)
+	}
+	p.mu.RLock()
+	pending := p.byUID["u1"].creditPendingMicro
+	p.mu.RUnlock()
+	if pending != 500_000 {
+		t.Errorf("pending=%d want 500000（0.5 credit 残余）", pending)
 	}
 }
 

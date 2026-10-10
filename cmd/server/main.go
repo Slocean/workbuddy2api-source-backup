@@ -246,7 +246,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	go sch.Run(ctx)
-	go sch.RefreshGlobalCredits()
+	go sch.RefreshCredits()
 
 	srv := &http.Server{
 		Addr:              cfg.Listen,

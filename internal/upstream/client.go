@@ -657,9 +657,11 @@ type Client struct {
 	// 与 efforts 同 realm 分层桶（同 C-2 隔离原则），共用 effortsMu。
 	defaultEfforts map[string]map[string]string
 
-	// globalModels 缓存 global 模型名目录纯动态探测结果（1h TTL + 5min 负缓存），
-	// 见 global_models.go。按实例持有，测试新建 Client 即隔离。
-	globalModels fetchGlobalModelsCache
+	// globalCatalogs 按 UID 缓存各 global 账号自己的模型目录探测结果（1h TTL +
+	// 5min 负缓存），见 global_models.go。按实例持有、按账号隔离——A 账号的目录
+	// 不得冒充 B 账号的选号证据；测试新建 Client 即隔离。
+	globalCatalogs   map[string]*fetchGlobalModelsCache
+	globalCatalogsMu sync.Mutex
 
 	// SanitizeFingerprints 出站请求体黑名单指纹脱敏开关（默认 true；false 完全还原）。
 	SanitizeFingerprints bool
@@ -1266,6 +1268,14 @@ func nonChatModel(id string, maxOutputTokens int64, tags []string) bool {
 // （credits 等字段以 v3 为准），企业端点只补 v3 缺失的模型。/v3 失败（400/网络错/解析
 // 失败）不拖累企业端点结果——降级为仅企业端点，warn 日志；反之亦然（两路独立容错）。
 func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
+	infos, _, err := c.FetchModelsDetailed(a)
+	return infos, err
+}
+
+// FetchModelsDetailed 同 FetchModels，另返回 complete：/v3/config 与企业端点
+// 双双成功时名单完整，缺失条目可作为否定证据；任一路失败即降级窄表，缺失
+// **不构成**否定证据（与 GlobalCatalog 同一口径，选号层按此区分）。
+func (c *Client) FetchModelsDetailed(a *auth.Auth) (infos []ModelInfo, complete bool, err error) {
 	type probeResult struct {
 		infos []ModelInfo
 		err   error
@@ -1283,7 +1293,7 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 	enterprise := <-enterpriseCh
 	v3 := <-v3Ch
 	if enterprise.err != nil && v3.err != nil {
-		return nil, enterprise.err // 两路全失败：返回企业端点错误（既有调用方语义零漂移）
+		return nil, false, enterprise.err // 两路全失败：返回企业端点错误（既有调用方语义零漂移）
 	}
 	if v3.err != nil {
 		// /v3 失败降级：不拖累企业端点结果（任务书实现要点：降级仅企业端点 + warn）。
@@ -1294,8 +1304,9 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 	}
 	out := mergeModelInfos(v3.infos, enterprise.infos)
 	if len(out) == 0 {
-		return nil, fmt.Errorf("models api returned empty list")
+		return nil, false, fmt.Errorf("models api returned empty list")
 	}
+	complete = v3.err == nil && enterprise.err == nil
 	// 刷新 effort 能力缓存（供请求体降级；无 supportedEfforts 的模型不入 efforts 桶）。
 	// 空桶时跳过写：避免「某探测无档位数据」清掉既有桶（例：cn 桶已有档位，再次探测返回全无等级 → 不应清空）。
 	cache := make(map[string][]string, len(out))
@@ -1309,11 +1320,11 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 		}
 	}
 	if len(cache) == 0 && len(defCache) == 0 {
-		return out, nil
+		return out, complete, nil
 	}
 	// 按探测账号的 realm 写入对应桶：CN 探测只进 cn 桶，global 同模型名不被污染（C-2）。
 	c.storeEfforts(a.Realm(), cache, defCache)
-	return out, nil
+	return out, complete, nil
 }
 
 // mergeModelInfos 合并两路模型目录：primary 为主（同 id 以 primary 条目为准——
